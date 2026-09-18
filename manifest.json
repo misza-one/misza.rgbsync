@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "misza.rgbsync",
+  "name": "RGB Sync",
+  "version": "0.1.0",
+  "author": "misza",
+  "license": "MIT",
+  "description": "Sync local PC lighting (OpenRGB) to the Omarchy theme accent.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "RGB Sync",
+    "description": "Toggle PC lighting sync to the Omarchy theme.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Render a theme-matched splash image for the NZXT Kraken LCD (640x640).
+
+Usage:
+    rgbsync-lcd --accent e09355 --title VAULT --top "LIQUID 31.0C" \
+        --bottom "PUMP 1363 RPM" --out /tmp/rgbsync-lcd.png
+    liquidctl --match Kraken set lcd screen static /tmp/rgbsync-lcd.png
+
+Only depends on the standard library plus system python-pillow.
+"""
+
+import argparse
+import os
+import sys
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+except ImportError:
+    print("rgbsync-lcd: python-pillow is required", file=sys.stderr)
+    sys.exit(2)
+
+import math
+
+SIZE = 640
+BG = (0x10, 0x13, 0x15)
+MUTED = (0x86, 0x76, 0x58)
+WHITE = (0xCA, 0xCC, 0xCC)
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+]
+
+
+def find_font():
+    for path in FONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def parse_hex(value):
+    text = value.strip().lstrip("#")
+    if len(text) != 6:
+        raise ValueError("accent must be RRGGBB, got %r" % value)
+    return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+
+
+def cover_crop(path, size, zoom=1.0, pan=(0.0, 0.0)):
+    """Wallpaper cover-fit to a size x size square.
+
+    zoom magnifies around the center; pan shifts the crop window in pixels
+    (1 output px == 1 scaled px, so pan units are zoom-independent).
+    The window is clamped to stay inside the scaled image.
+    """
+    img = Image.open(path).convert("RGB")
+    s0 = max(size / img.width, size / img.height)
+    s = s0 * max(1.0, zoom)
+    scaled = img.resize((round(img.width * s), round(img.height * s)))
+    cx = scaled.width / 2 + pan[0]
+    cy = scaled.height / 2 + pan[1]
+    cx = min(max(cx, size / 2), scaled.width - size / 2)
+    cy = min(max(cy, size / 2), scaled.height - size / 2)
+    box = (round(cx - size / 2), round(cy - size / 2),
+           round(cx + size / 2), round(cy + size / 2))
+    return scaled.crop(box)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--accent", required=True, help="RRGGBB theme accent")
+    parser.add_argument("--title", default="",
+                        help="center title (empty hides it)")
+    parser.add_argument("--top", default="",
+                        help="top arc line (empty hides it)")
+    parser.add_argument("--bottom", default="",
+                        help="bottom arc line (empty hides it)")
+    parser.add_argument("--temp", default="--", help="liquid temp in C")
+    parser.add_argument("--pump", default="--", help="pump rpm")
+    parser.add_argument("--wallpaper", default="",
+                        help="theme background image (cover-fit, dimmed)")
+    parser.add_argument("--dim", default="0.5",
+                        help="wallpaper brightness multiplier 0-1")
+    parser.add_argument("--zoom", default="1.0",
+                        help="wallpaper zoom multiplier >= 1")
+    parser.add_argument("--pan", default="0,0",
+                        help="wallpaper pan offset in px, e.g. 40,-20")
+    parser.add_argument("--out", required=True, help="output PNG path")
+    args = parser.parse_args()
+
+    try:
+        accent = parse_hex(args.accent)
+    except ValueError as exc:
+        print("rgbsync-lcd: %s" % exc, file=sys.stderr)
+        return 2
+
+    img = Image.new("RGB", (SIZE, SIZE), BG)
+    if args.wallpaper and os.path.exists(args.wallpaper):
+        try:
+            dim = float(args.dim)
+        except ValueError:
+            dim = 0.5
+        dim = min(max(dim, 0.1), 1.0)
+        try:
+            zoom = float(args.zoom)
+        except ValueError:
+            zoom = 1.0
+        zoom = max(1.0, zoom)
+        try:
+            pan_parts = args.pan.split(",")
+            pan = (float(pan_parts[0]), float(pan_parts[1]))
+        except (ValueError, IndexError):
+            pan = (0.0, 0.0)
+        img = ImageEnhance.Brightness(
+            cover_crop(args.wallpaper, SIZE, zoom, pan)).enhance(dim)
+    draw = ImageDraw.Draw(img, "RGBA")
+    center = SIZE // 2
+
+    # The pump LCD is ROUND. No backdrop disc by design: the wallpaper stays
+    # bare and only the inscriptions sit on top of it. The frame is a ring
+    # so no square corner ever falls outside the visible circle.
+    draw.ellipse([14, 14, SIZE - 14, SIZE - 14], outline=accent, width=12)
+    draw.ellipse([38, 38, SIZE - 38, SIZE - 38], outline=MUTED, width=2)
+
+    font_path = find_font()
+
+    def load_font(size):
+        if font_path:
+            return ImageFont.truetype(font_path, size)
+        return ImageFont.load_default()
+
+    def text_width(font, text):
+        try:
+            return font.getlength(text)
+        except AttributeError:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            return bbox[2] - bbox[0]
+
+    def fit_font(text, start, max_width):
+        size = start
+        while True:
+            font = load_font(size)
+            if text_width(font, text) <= max_width or size <= 18:
+                return font
+            size -= 4
+
+    def shadowed(xy, text, font, fill):
+        draw.text((xy[0] + 3, xy[1] + 3), text, font=font, fill=(0, 0, 0, 220),
+                  anchor="mm")
+        draw.text(xy, text, font=font, fill=fill, anchor="mm")
+
+    def arc_text(text, font, fill, radius, top=False, tracking=3):
+        """Render text along the display curvature.
+
+        Bottom arc (top=False): glyphs run left-to-right through the bottom
+        point, tops pointing at the circle center. Top arc (top=True):
+        glyphs run left-to-right over the top point, tops pointing outward.
+        Both hug the round edge like a watch-face badge.
+        """
+        widths = [text_width(font, ch) for ch in text]
+        total = sum(widths) + tracking * max(0, len(text) - 1)
+        pos = -total / 2.0
+        for ch, width in zip(text, widths):
+            ang = (pos + width / 2.0) / radius
+            if top:
+                x = center + radius * math.sin(ang)
+                y = center - radius * math.cos(ang)
+                rot = -ang * 180.0 / math.pi
+            else:
+                x = center + radius * math.sin(ang)
+                y = center + radius * math.cos(ang)
+                rot = ang * 180.0 / math.pi
+            bbox = draw.textbbox((0, 0), ch, font=font)
+            tile_w = bbox[2] - bbox[0] + 10
+            tile_h = bbox[3] - bbox[1] + 10
+            tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
+            tile_draw = ImageDraw.Draw(tile)
+            tile_draw.text((5 - bbox[0] + 2, 5 - bbox[1] + 2), ch, font=font,
+                           fill=(0, 0, 0, 220))
+            tile_draw.text((5 - bbox[0], 5 - bbox[1]), ch, font=font,
+                           fill=fill)
+            tile = tile.rotate(rot, expand=True,
+                               resample=Image.BICUBIC)
+            img.paste(tile, (int(round(x - tile.width / 2)),
+                             int(round(y - tile.height / 2))), tile)
+            pos += width + tracking
+
+    # Watch-face badge: top arc, bottom arc, theme title in the center.
+    # Empty strings hide their element. Both arcs share one size (the
+    # smaller of the two fits) so they read as a matched pair.
+    arcs = []
+    if args.top:
+        arcs.append((args.top, 262, True))
+    if args.bottom:
+        arcs.append((args.bottom, 268, False))
+
+    def fit_arc_size(text, radius):
+        size = 46
+        while True:
+            arc_len = text_width(load_font(size), text) \
+                + 3 * max(0, len(text) - 1)
+            if arc_len <= radius * math.radians(100) or size <= 20:
+                return size
+            size -= 2
+
+    if arcs:
+        arc_font = load_font(min(fit_arc_size(text, radius)
+                                 for text, radius, _top in arcs))
+        for text, radius, top in arcs:
+            arc_text(text, arc_font, WHITE + (255,), radius, top=top)
+
+    if args.title:
+        title = args.title.upper().replace("_", " ").replace("-", " ")[:16] \
+            or "CURRENT"
+        shadowed((center, 320), title, fit_font(title, 100, 560), WHITE + (255,))
+
+        # Accent rule under the title.
+        draw.rectangle([center - 90, 388, center + 90, 394], fill=accent)
+
+    img.save(args.out)
+    print("wrote %s" % args.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
