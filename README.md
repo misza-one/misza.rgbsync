@@ -30,6 +30,26 @@ omarchy plugin add https://github.com/misza-one/misza.rgbsync.git --enable
 - Hardware access: user in `input` + `i2c` groups (or active logind session
   via uaccess). Re-login after adding groups.
 
+```sh
+# Arch/Omarchy
+sudo pacman -S openrgb i2c-tools python-pillow
+pipx install liquidctl   # or: pip install --user liquidctl
+
+# NZXT Kraken / RGB Controller access without re-login (udev/ in this repo)
+sudo cp udev/71-nzxt-uaccess.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb
+
+# Verify (no sudo):
+openrgb --list-devices
+liquidctl list
+```
+
+On a fresh machine the service probes all of this at startup and reports
+exactly what is missing (`omarchy-shell misza.rgbsync status`, `deps=`).
+Unknown hardware picks the first usable OpenRGB mode automatically
+(Direct → Static → anything but Off); per-device overrides live in config.
+
 IPC: `omarchy-shell misza.rgbsync status` / `... refresh`.
 
 ## Config

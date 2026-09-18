@@ -71,6 +71,9 @@ Panel {
         + " lcd=" + root.svc.lcdEnabled
         + " liquid=" + root.svc.lcdTemp + "C pump=" + root.svc.lcdPump
         + " fan=" + root.svc.lcdFan
+        + " deps=" + (!root.svc.depsProbed ? "probing"
+          : root.svc.depsMissing.length === 0 ? "ok"
+          : root.svc.depsMissing.join(","))
         + (root.svc.lastError ? " error=" + root.svc.lastError : "")
     }
 

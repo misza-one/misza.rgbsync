@@ -24,7 +24,8 @@ QtObject {
   readonly property string themeNamePath: home + "/.local/state/omarchy/current/theme.name"
   readonly property string backgroundPath: home + "/.local/state/omarchy/current/background"
   readonly property string lcdImagePath: configDir + "/lcd.png"
-  readonly property string openrgbBinary: "/usr/bin/openrgb"
+  // Resolved at startup: packagers put it here, otherwise PATH lookup.
+  property string openrgbBinary: "/usr/bin/openrgb"
 
   // The RTX 4090 Suprim X only holds the colour when its single zone is
   // addressed explicitly, and its reported mode stays [Off] either way, so
@@ -481,9 +482,52 @@ QtObject {
     return null
   }
 
-  function modeFor(name) {
+  function modeFor(name, modes) {
     var key = root.matchKey(root.deviceModes, name)
-    return key !== null ? String(root.deviceModes[key]) : "Direct"
+    if (key !== null) return String(root.deviceModes[key])
+    return root.autoMode(modes || [])
+  }
+
+  // First usable mode straight from `openrgb --list-devices`: Direct wins,
+  // then Static, then anything except Off (selecting Off would darken LEDs
+  // as the "sync" result). User deviceModes entries always win.
+  function autoMode(modes) {
+    var i
+    for (i = 0; i < modes.length; i++) {
+      if (String(modes[i]).toLowerCase() === "direct") return modes[i]
+    }
+    for (i = 0; i < modes.length; i++) {
+      if (String(modes[i]).toLowerCase() === "static") return modes[i]
+    }
+    for (i = 0; i < modes.length; i++) {
+      if (String(modes[i]).toLowerCase() !== "off") return modes[i]
+    }
+    return "Direct"
+  }
+
+  function parseModes(line) {
+    var text = String(line || "").replace(/^ *Modes: */, "")
+    var modes = []
+    var cur = ""
+    var inQuote = false
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i]
+      if (ch === "'") {
+        inQuote = !inQuote
+        continue
+      }
+      if (ch === " " && !inQuote) {
+        if (cur !== "") {
+          modes.push(cur)
+          cur = ""
+        }
+        continue
+      }
+      if ((ch === "[" || ch === "]") && !inQuote) continue
+      cur += ch
+    }
+    if (cur !== "") modes.push(cur)
+    return modes
   }
 
   function zoneFor(name) {
@@ -502,7 +546,7 @@ QtObject {
       out.push({
         index: device.index,
         name: device.name,
-        mode: root.modeFor(device.name),
+        mode: root.modeFor(device.name, device.modes),
         zone: root.zoneFor(device.name)
       })
     }
@@ -514,7 +558,14 @@ QtObject {
     var lines = String(text || "").split("\n")
     for (var i = 0; i < lines.length; i++) {
       var match = lines[i].match(/^(\d+):\s+(.+)$/)
-      if (match) found.push({ index: parseInt(match[1], 10), name: match[2].trim() })
+      if (match) {
+        found.push({ index: parseInt(match[1], 10), name: match[2].trim(),
+                     modes: [] })
+        continue
+      }
+      if (/^ *Modes: /.test(lines[i]) && found.length > 0) {
+        found[found.length - 1].modes = root.parseModes(lines[i])
+      }
     }
     return found
   }
@@ -601,6 +652,115 @@ QtObject {
         root.pendingHex = ""
         if (next !== root.lastAppliedHex) root.applyNow()
       }
+    }
+  }
+
+  // ------------------------------------------------------------ dependencies
+
+  property var depsMissing: []
+  property bool depsProbed: false
+  property var probeQueue: []
+  property string probeKey: ""
+  property bool probeActive: false
+  property bool probeFallbackTried: false
+
+  function depsHint(key) {
+    if (key === "openrgb") {
+      return "openrgb not found — install the openrgb package for RGB control."
+    }
+    if (key === "liquidctl") {
+      return "liquidctl not found — pipx install liquidctl (Kraken LCD only)."
+    }
+    if (key === "python3") {
+      return "python3 not found — needed to render the LCD image."
+    }
+    return "python-pillow not found — install python-pillow to render the LCD image."
+  }
+
+  function startDepsProbe() {
+    root.depsMissing = []
+    root.depsProbed = false
+    root.probeQueue = [
+      { key: "openrgb", program: root.openrgbBinary, args: ["--help"],
+        fallback: "openrgb" },
+      { key: "liquidctl", program: root.liquidctlBinary, args: ["--version"] },
+      { key: "python3", program: "python3", args: ["--version"] },
+      { key: "pillow", program: "python3", args: ["-c", "import PIL"] }
+    ]
+    root.log("probing dependencies")
+    root.probeNext()
+  }
+
+  function probeNext() {
+    if (root.probeQueue.length === 0) {
+      root.depsProbed = true
+      root.log(root.depsMissing.length === 0
+        ? "dependencies ok"
+        : "missing: " + root.depsMissing.join(", "))
+      // Enumeration doubles as the functional openrgb check; the chained
+      // apply is a no-op while disabled.
+      root.applyAfterEnum = true
+      root.enumerate()
+      return
+    }
+    var item = root.probeQueue[0]
+    root.probeKey = item.key
+    root.probeFallbackTried = false
+    root.probeActive = true
+    probeWatchdog.restart()
+    probeProcess.command = [item.program].concat(item.args)
+    probeProcess.running = true
+  }
+
+  function probeDone(ok) {
+    probeWatchdog.stop()
+    if (root.probeQueue.length === 0) return
+    var item = root.probeQueue[0]
+    if (!ok && item.fallback && !root.probeFallbackTried
+        && item.program !== item.fallback) {
+      root.probeFallbackTried = true
+      root.log("retrying " + item.key + " via PATH (" + item.fallback + ")")
+      if (item.key === "openrgb") root.openrgbBinary = item.fallback
+      root.probeActive = true
+      probeWatchdog.restart()
+      probeProcess.command = [item.fallback].concat(item.args)
+      probeProcess.running = true
+      return
+    }
+    root.probeQueue.shift()
+    if (!ok) {
+      root.depsMissing.push(item.key)
+      var relevant = item.key === "openrgb" ? root.enabled
+        : item.key === "python3" ? (root.enabled || root.lcdEnabled)
+        : root.lcdEnabled
+      if (relevant) root.fail("deps", root.depsHint(item.key))
+      else root.log("missing but unused: " + item.key)
+    }
+    root.probeNext()
+  }
+
+  property Process probeProcess: Process {
+    stdout: SplitParser {
+      onRead: function(value) {}
+    }
+    stderr: SplitParser {
+      onRead: function(value) {}
+    }
+    onExited: function(exitCode) {
+      if (!root.probeActive) return
+      root.probeActive = false
+      root.probeDone(exitCode === 0)
+    }
+  }
+
+  property Timer probeWatchdog: Timer {
+    interval: 8000
+    onTriggered: {
+      if (!root.probeActive) return
+      root.probeActive = false
+      root.log("probe timeout: " + root.probeKey)
+      probeProcess.running = false
+      root.probeDone(false)
     }
   }
 
@@ -843,9 +1003,8 @@ QtObject {
 
   Component.onCompleted: {
     root.configDirProcess.running = true
-    // Always chain: applyNow is a no-op while disabled, and this restores
-    // lighting on session start when enabled. Config may load after this.
-    root.applyAfterEnum = true
-    root.enumerate()
+    // Probes gate enumeration: a missing openrgb fails here with a readable
+    // hint instead of a bare device-scan error. Config may load after this.
+    root.startDepsProbe()
   }
 }

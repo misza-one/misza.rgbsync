@@ -1,0 +1,13 @@
+# Grant the active-seat user direct access to NZXT Kraken / RGB Controller
+# hidraw + USB nodes (liquidctl + OpenRGB from a user session).
+# The stock 90-liquidctl-kraken.rules only sets GROUP=input (needs re-login);
+# these uaccess tags work immediately for the active session and survive
+# reboots. Install with:
+#   sudo cp udev/71-nzxt-uaccess.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="300c", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="2012", TAG+="uaccess"
+# ...plus the raw USB nodes (string descriptors, bulk transfers for the LCD).
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="300c", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="2012", TAG+="uaccess"
