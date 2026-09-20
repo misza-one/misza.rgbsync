@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Set a Keychron Q3 Pro RGB matrix to one solid RGB colour via VIA Raw HID."""
+
+import colorsys
+import sys
+
+import hid
+
+VID = 0x3434
+PID = 0x0631
+RAW_HID_INTERFACE = 1
+PACKET_SIZE = 33  # report ID + QMK's 32-byte Raw HID payload
+VIA_CUSTOM_SET_VALUE = 0x07
+VIA_CUSTOM_GET_VALUE = 0x08
+RGB_MATRIX_CHANNEL = 0x03
+RGB_BRIGHTNESS = 0x01
+RGB_EFFECT = 0x02
+RGB_COLOR = 0x04
+SOLID_EFFECT = 0x01
+
+
+def packet(*values: int) -> bytes:
+    data = bytearray(PACKET_SIZE)
+    data[0] = 0  # HID report ID
+    data[1 : 1 + len(values)] = bytes(values)
+    return bytes(data)
+
+
+def via_command(device, *values: int) -> list[int]:
+    written = device.write(packet(*values))
+    if written != PACKET_SIZE:
+        raise RuntimeError(f"short Raw HID write ({written}/{PACKET_SIZE})")
+    reply = device.read(PACKET_SIZE - 1, 500)
+    if not reply:
+        raise RuntimeError("keyboard did not acknowledge the VIA command")
+    if reply[: len(values)] != list(values):
+        raise RuntimeError(f"unexpected VIA response: {reply[:len(values)]}")
+    return reply
+
+
+def raw_hid_path() -> bytes:
+    devices = hid.enumerate(VID, PID)
+    for device in devices:
+        if device.get("interface_number") == RAW_HID_INTERFACE:
+            return device["path"]
+    raise RuntimeError("Keychron Q3 Pro Raw HID interface not found (use wired mode)")
+
+
+def set_color(hex_color: str) -> None:
+    value = hex_color.removeprefix("#")
+    if len(value) != 6:
+        raise ValueError("color must be six hexadecimal digits")
+    red, green, blue = (int(value[index : index + 2], 16) for index in (0, 2, 4))
+    hue, saturation, brightness = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
+    hue_byte = round(hue * 255) & 0xFF
+    saturation_byte = round(saturation * 255)
+    brightness_byte = round(brightness * 255)
+
+    device = hid.device()
+    device.open_path(raw_hid_path())
+    try:
+        via_command(device, VIA_CUSTOM_SET_VALUE, RGB_MATRIX_CHANNEL,
+                    RGB_EFFECT, SOLID_EFFECT)
+        via_command(device, VIA_CUSTOM_SET_VALUE, RGB_MATRIX_CHANNEL,
+                    RGB_COLOR, hue_byte, saturation_byte)
+        via_command(device, VIA_CUSTOM_SET_VALUE, RGB_MATRIX_CHANNEL,
+                    RGB_BRIGHTNESS, brightness_byte)
+        effect = via_command(device, VIA_CUSTOM_GET_VALUE, RGB_MATRIX_CHANNEL,
+                             RGB_EFFECT)
+        color = via_command(device, VIA_CUSTOM_GET_VALUE, RGB_MATRIX_CHANNEL,
+                            RGB_COLOR)
+        if effect[3] != SOLID_EFFECT or color[3:5] != [hue_byte, saturation_byte]:
+            raise RuntimeError("keyboard did not retain the requested lighting state")
+    finally:
+        device.close()
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(f"usage: {sys.argv[0]} RRGGBB", file=sys.stderr)
+        return 2
+    try:
+        set_color(sys.argv[1])
+    except Exception as error:
+        print(f"Keychron sync failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

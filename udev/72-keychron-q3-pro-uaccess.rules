@@ -1,0 +1,5 @@
+# Grant the active-seat user access to the Keychron Q3 Pro VIA Raw HID
+# interface used by rgbsync-keychron. The USB rule covers python-hid builds
+# backed by libusb; the hidraw rule covers hidapi's hidraw backend.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3434", ATTRS{idProduct}=="0631", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="3434", ATTRS{idProduct}=="0631", TAG+="uaccess"

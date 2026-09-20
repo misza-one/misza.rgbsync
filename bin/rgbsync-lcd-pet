@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Theme-splash compositor + CAM 0x09 streamer for the Kraken Elite LCD.
+
+Renders the wallpaper (dimmed, framed, titled) and walks an OpenPets-style
+spritesheet on top of it. --preview writes a PNG. --state runs until SIGTERM,
+reloading JSON whenever it changes.
+
+State JSON keys: accent, title, top, bottom, wallpaper, dim, zoom, panX, panY,
+brightness, spritesheet, fps, petScale, petX, petY.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import signal
+import sys
+import time
+
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from kraken_lcd import FRAME_BYTES, HEIGHT, WIDTH, KrakenLcd, KrakenLcdError
+
+SIZE = WIDTH
+BG = (0x10, 0x13, 0x15)
+MUTED = (0x86, 0x76, 0x58)
+WHITE = (0xCA, 0xCC, 0xCC)
+COLS = 8
+ROWS = 3  # bundled sheet: idle, run-right, run-left
+PET_H = 176
+ROW_IDLE = 0
+ROW_RIGHT = 1
+ROW_LEFT = 2
+FONT_CANDIDATES = [
+    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+]
+DEFAULT_SHEET = os.path.normpath(os.path.join(HERE, "..", "assets", "pet.webp"))
+
+
+def log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def find_font() -> str | None:
+    for path in FONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def parse_hex(value: str) -> tuple[int, int, int]:
+    text = str(value or "").strip().lstrip("#")
+    if len(text) != 6:
+        raise ValueError("accent must be RRGGBB, got %r" % value)
+    return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+
+
+def cover_crop(path: str, size: int, zoom: float = 1.0,
+               pan: tuple[float, float] = (0.0, 0.0)) -> Image.Image:
+    img = Image.open(path).convert("RGB")
+    s0 = max(size / img.width, size / img.height)
+    s = s0 * max(1.0, zoom)
+    scaled = img.resize((round(img.width * s), round(img.height * s)))
+    cx = scaled.width / 2 + pan[0]
+    cy = scaled.height / 2 + pan[1]
+    cx = min(max(cx, size / 2), scaled.width - size / 2)
+    cy = min(max(cy, size / 2), scaled.height - size / 2)
+    box = (round(cx - size / 2), round(cy - size / 2),
+           round(cx + size / 2), round(cy + size / 2))
+    return scaled.crop(box)
+
+
+def to_bgr888(img: Image.Image) -> bytes:
+    rgb = img.convert("RGB")
+    r, g, b = rgb.split()
+    data = Image.merge("RGB", (b, g, r)).tobytes()
+    if len(data) != FRAME_BYTES:
+        raise RuntimeError("bgr size %s" % len(data))
+    return data
+
+
+def load_sheet(path: str, pet_h: int) -> list[list[Image.Image]]:
+    img = Image.open(path).convert("RGBA")
+    # OpenPets downloads are normally the full 8×9 sheet. The bundled asset
+    # is cropped to the three rows used here: idle, run-right, run-left.
+    source_rows = 9 if img.height > img.width else ROWS
+    fw = img.width // COLS
+    fh = img.height // source_rows
+    if fw < 8 or fh < 8:
+        raise RuntimeError("spritesheet too small: %sx%s" % img.size)
+    pet_h = max(64, min(400, int(pet_h)))
+    rows = []
+    for r in range(ROWS):
+        row = []
+        for c in range(COLS):
+            tile = img.crop((c * fw, r * fh, (c + 1) * fw, (r + 1) * fh))
+            if fh != pet_h:
+                nw = max(1, round(fw * pet_h / fh))
+                tile = tile.resize((nw, pet_h), Image.Resampling.NEAREST)
+            row.append(tile)
+        rows.append(row)
+    return rows
+
+
+class Splash:
+    def __init__(self) -> None:
+        self.font_path = find_font()
+        self.base: Image.Image | None = None
+        self.overlay: Image.Image | None = None
+        self.sheet: list[list[Image.Image]] | None = None
+        self.sheet_path = ""
+        self.sheet_h = 0
+        self.cache_key = ""
+        self.x = 160.0
+        self.dir = 1
+        self.frame = 0
+        self.left = 110.0
+        self.right = 530.0
+        self.feet_y = 510
+
+    def _font(self, size: int) -> ImageFont.ImageFont:
+        if self.font_path:
+            return ImageFont.truetype(self.font_path, size)
+        return ImageFont.load_default()
+
+    def _text_width(self, draw: ImageDraw.ImageDraw, font, text: str) -> float:
+        try:
+            return font.getlength(text)
+        except AttributeError:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            return bbox[2] - bbox[0]
+
+    def _arc_text(self, img: Image.Image, draw: ImageDraw.ImageDraw, text: str,
+                  font, fill, radius: float, top: bool, tracking: int = 3) -> None:
+        center = SIZE // 2
+        widths = [self._text_width(draw, font, ch) for ch in text]
+        total = sum(widths) + tracking * max(0, len(text) - 1)
+        pos = -total / 2.0
+        for ch, width in zip(text, widths):
+            ang = (pos + width / 2.0) / radius
+            if top:
+                x = center + radius * math.sin(ang)
+                y = center - radius * math.cos(ang)
+                rot = -ang * 180.0 / math.pi
+            else:
+                x = center + radius * math.sin(ang)
+                y = center + radius * math.cos(ang)
+                rot = ang * 180.0 / math.pi
+            bbox = draw.textbbox((0, 0), ch, font=font)
+            tile_w = bbox[2] - bbox[0] + 10
+            tile_h = bbox[3] - bbox[1] + 10
+            tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
+            tile_draw = ImageDraw.Draw(tile)
+            tile_draw.text((5 - bbox[0] + 2, 5 - bbox[1] + 2), ch, font=font,
+                           fill=(0, 0, 0, 220))
+            tile_draw.text((5 - bbox[0], 5 - bbox[1]), ch, font=font, fill=fill)
+            tile = tile.rotate(rot, expand=True, resample=Image.BICUBIC)
+            img.alpha_composite(tile, (int(round(x - tile.width / 2)),
+                                       int(round(y - tile.height / 2))))
+            pos += width + tracking
+
+    def _fit_arc_size(self, draw, text: str, radius: float) -> int:
+        size = 46
+        while True:
+            font = self._font(size)
+            arc_len = self._text_width(draw, font, text) + 3 * max(0, len(text) - 1)
+            if arc_len <= radius * math.radians(100) or size <= 20:
+                return size
+            size -= 2
+
+    def _fit_font(self, draw, text: str, start: int, max_width: int):
+        size = start
+        while True:
+            font = self._font(size)
+            if self._text_width(draw, font, text) <= max_width or size <= 18:
+                return font
+            size -= 4
+
+    def _build_base(self, state: dict) -> Image.Image:
+        wallpaper = state.get("wallpaper") or ""
+        img = Image.new("RGB", (SIZE, SIZE), BG)
+        if wallpaper and os.path.exists(wallpaper):
+            dim = min(max(float(state.get("dim", 0.5)), 0.1), 1.0)
+            zoom = max(1.0, float(state.get("zoom", 1.0)))
+            pan = (float(state.get("panX", 0)), float(state.get("panY", 0)))
+            img = ImageEnhance.Brightness(
+                cover_crop(wallpaper, SIZE, zoom, pan)
+            ).enhance(dim)
+        return img
+
+    def _build_overlay(self, state: dict) -> Image.Image:
+        overlay = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay, "RGBA")
+        try:
+            accent = parse_hex(state.get("accent") or "e09355")
+        except ValueError:
+            accent = (0xE0, 0x93, 0x55)
+        draw.ellipse([14, 14, SIZE - 14, SIZE - 14], outline=accent + (255,),
+                     width=12)
+        draw.ellipse([38, 38, SIZE - 38, SIZE - 38], outline=MUTED + (255,),
+                     width=2)
+
+        title = str(state.get("title") or "")
+        top = str(state.get("top") or "")
+        bottom = str(state.get("bottom") or "")
+        arcs = []
+        if top:
+            arcs.append((top, 262, True))
+        if bottom:
+            arcs.append((bottom, 268, False))
+        if arcs:
+            arc_font = self._font(min(self._fit_arc_size(draw, text, radius)
+                                      for text, radius, _top in arcs))
+            for text, radius, is_top in arcs:
+                self._arc_text(overlay, draw, text, arc_font, WHITE + (255,),
+                               radius, top=is_top)
+        if title:
+            label = title.upper().replace("_", " ").replace("-", " ")[:16] \
+                or "CURRENT"
+            font = self._fit_font(draw, label, 100, 560)
+            cx, cy = SIZE // 2, 250
+            draw.text((cx + 3, cy + 3), label, font=font, fill=(0, 0, 0, 220),
+                      anchor="mm")
+            draw.text((cx, cy), label, font=font, fill=WHITE + (255,),
+                      anchor="mm")
+            draw.rectangle([cx - 90, 318, cx + 90, 324], fill=accent + (255,))
+        return overlay
+
+    def ensure(self, state: dict) -> None:
+        sheet = state.get("spritesheet") or DEFAULT_SHEET
+        try:
+            scale = float(state.get("petScale", 1.0))
+        except (TypeError, ValueError):
+            scale = 1.0
+        scale = min(2.5, max(0.5, scale))
+        pet_h = max(64, int(round(PET_H * scale)))
+        try:
+            pet_x = int(float(state.get("petX", 0)))
+        except (TypeError, ValueError):
+            pet_x = 0
+        try:
+            feet = int(float(state.get("petY", 510)))
+        except (TypeError, ValueError):
+            feet = 510
+        self.feet_y = min(620, max(360, feet))
+        center = 320 + min(220, max(-220, pet_x))
+        span = 200
+        self.left = max(70, center - span)
+        self.right = min(570, center + span)
+        if self.x < self.left:
+            self.x = self.left
+        if self.x > self.right:
+            self.x = self.right
+        if sheet != self.sheet_path or pet_h != self.sheet_h:
+            if os.path.exists(sheet):
+                try:
+                    self.sheet = load_sheet(sheet, pet_h)
+                    self.sheet_path = sheet
+                    self.sheet_h = pet_h
+                    log("sheet %s h=%s" % (sheet, pet_h))
+                except Exception as extra:
+                    log("sheet load failed: %s" % extra)
+                    self.sheet = None
+                    self.sheet_path = sheet
+                    self.sheet_h = pet_h
+            else:
+                log("sheet missing: %s" % sheet)
+                self.sheet = None
+                self.sheet_path = sheet
+                self.sheet_h = pet_h
+        key = "|".join([
+            str(state.get("wallpaper") or ""),
+            str(state.get("dim")),
+            str(state.get("zoom")),
+            str(state.get("panX")),
+            str(state.get("panY")),
+            str(state.get("accent") or ""),
+            str(state.get("title") or ""),
+            str(state.get("top") or ""),
+            str(state.get("bottom") or ""),
+        ])
+        if key == self.cache_key and self.base is not None:
+            return
+        self.base = self._build_base(state)
+        self.overlay = self._build_overlay(state)
+        self.cache_key = key
+
+    def step(self, dt: float) -> None:
+        speed = 90.0
+        self.x += self.dir * speed * dt
+        if self.x >= self.right:
+            self.x = self.right
+            self.dir = -1
+        elif self.x <= self.left:
+            self.x = self.left
+            self.dir = 1
+        self.frame = (self.frame + 1) % COLS
+
+    def render(self, rotate_deg: int = 0) -> Image.Image:
+        if self.base is None:
+            frame = Image.new("RGB", (SIZE, SIZE), BG)
+        else:
+            frame = self.base.copy()
+        if self.sheet:
+            row = ROW_RIGHT if self.dir > 0 else ROW_LEFT
+            pet = self.sheet[row][self.frame % COLS]
+            px = int(round(self.x - pet.width / 2))
+            py = self.feet_y - pet.height
+            frame.paste(pet, (px, py), pet)
+        if self.overlay is not None:
+            frame.paste(self.overlay, (0, 0), self.overlay)
+        if rotate_deg:
+            frame = frame.rotate(-rotate_deg, expand=False, fillcolor=BG)
+        return frame
+
+
+def default_state() -> dict:
+    return {
+        "accent": "e09355",
+        "title": "",
+        "top": "",
+        "bottom": "",
+        "wallpaper": "",
+        "dim": 0.5,
+        "zoom": 1.0,
+        "panX": 0,
+        "panY": 0,
+        "brightness": 60,
+        "spritesheet": DEFAULT_SHEET,
+        "fps": 10,
+        "petScale": 1.0,
+        "petX": 0,
+        "petY": 510,
+    }
+
+def load_state(path: str) -> dict:
+    state = default_state()
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError("state is not an object")
+    state.update(raw)
+    return state
+
+
+def run_preview(state: dict, out: str, rotate: int) -> int:
+    splash = Splash()
+    splash.ensure(state)
+    splash.x = 320
+    img = splash.render(rotate)
+    img.save(out)
+    print("wrote %s" % out, flush=True)
+    return 0
+
+
+def run_stream(state_path: str, once: bool) -> int:
+    stop = {"flag": False}
+
+    def handle(_signum, _frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGTERM, handle)
+    signal.signal(signal.SIGINT, handle)
+
+    splash = Splash()
+    mtime = 0.0
+    state = default_state()
+    lcd = KrakenLcd()
+    try:
+        lcd.open()
+        info = lcd.read_lcd_info()
+        log("lcd info brightness=%s orientation=%s" % info)
+        # CAM 0x09 is raw pixels; match the pump's reported orientation.
+        rotate = (lcd.orientation % 4) * 90
+        if os.path.exists(state_path):
+            state = load_state(state_path)
+            mtime = os.path.getmtime(state_path)
+        lcd.enter_streaming(int(state.get("brightness", 60)))
+        log("streaming")
+        splash.ensure(state)
+        fps = max(4, min(20, int(state.get("fps", 10) or 10)))
+        period = 1.0 / fps
+        next_tick = time.monotonic()
+        frames = 0
+        last_status = 0.0
+        last_bright = int(state.get("brightness", 60))
+        while not stop["flag"]:
+            if os.path.exists(state_path):
+                new_mtime = os.path.getmtime(state_path)
+                if new_mtime != mtime:
+                    try:
+                        state = load_state(state_path)
+                        mtime = new_mtime
+                        splash.ensure(state)
+                        fps = max(4, min(20, int(state.get("fps", 10) or 10)))
+                        period = 1.0 / fps
+                        bright = int(state.get("brightness", 60))
+                        if bright != last_bright:
+                            lcd.set_brightness(bright)
+                            last_bright = bright
+                        log("state reloaded")
+                    except Exception as exc:
+                        log("state reload failed: %s" % exc)
+            now = time.monotonic()
+            splash.step(period)
+            frame = splash.render(rotate)
+            want_status = now - last_status >= 2.0
+            st = lcd.push_frame_bgr(to_bgr888(frame), with_status=want_status)
+            frames += 1
+            if want_status:
+                last_status = now
+                if st:
+                    print(
+                        "status liquid=%.1f pump=%s fan=%s frames=%s"
+                        % (st["liquid"], st["pump"], st["fan"], frames),
+                        flush=True,
+                    )
+            if once:
+                return 0
+            next_tick += period
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_tick = time.monotonic()
+        log("stopped after %s frames" % frames)
+        return 0
+    except KrakenLcdError as exc:
+        log("kraken: %s" % exc)
+        return 1
+    finally:
+        lcd.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--state", default="", help="JSON state file to watch")
+    parser.add_argument("--preview", default="", help="write one PNG and exit")
+    parser.add_argument("--once", action="store_true",
+                        help="stream one frame then exit")
+    parser.add_argument("--wallpaper", default="")
+    parser.add_argument("--accent", default="e09355")
+    parser.add_argument("--title", default="")
+    parser.add_argument("--top", default="")
+    parser.add_argument("--bottom", default="")
+    parser.add_argument("--spritesheet", default=DEFAULT_SHEET)
+    parser.add_argument("--dim", default="0.5")
+    parser.add_argument("--zoom", default="1")
+    parser.add_argument("--pan", default="0,0")
+    parser.add_argument("--rotate", default="0",
+                        help="preview rotation degrees clockwise")
+    args = parser.parse_args()
+
+    state = default_state()
+    state["wallpaper"] = args.wallpaper
+    state["accent"] = args.accent
+    state["title"] = args.title
+    state["top"] = args.top
+    state["bottom"] = args.bottom
+    state["spritesheet"] = args.spritesheet or DEFAULT_SHEET
+    try:
+        state["dim"] = float(args.dim)
+        state["zoom"] = float(args.zoom)
+        parts = args.pan.split(",")
+        state["panX"] = float(parts[0])
+        state["panY"] = float(parts[1])
+    except (ValueError, IndexError):
+        pass
+
+    if args.preview:
+        try:
+            rotate = int(args.rotate)
+        except ValueError:
+            rotate = 0
+        if args.state and os.path.exists(args.state):
+            state.update(load_state(args.state))
+        return run_preview(state, args.preview, rotate)
+
+    if not args.state and not args.once:
+        log("need --state PATH or --preview OUT")
+        return 2
+    path = args.state or os.path.join(os.environ.get("HOME", "/tmp"),
+                                      ".config/omarchy/misza.rgbsync/lcd-pet.json")
+    return run_stream(path, args.once)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

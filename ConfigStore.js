@@ -6,7 +6,8 @@ var KEYS = [
   "brightness", "refreshInterval",
   "lcdEnabled", "lcdBrightness", "lcdWallpaper", "lcdDim", "lcdThemeName",
   "lcdTitle", "lcdTop", "lcdBottom",
-  "lcdZoom", "lcdPanX", "lcdPanY", "liquidctlBinary"
+  "lcdZoom", "lcdPanX", "lcdPanY", "lcdPet", "lcdPetPath",
+  "lcdPetFavorites", "lcdPetScale", "lcdPetX", "lcdPetY", "liquidctlBinary"
 ]
 
 function stringList(value, fallback) {
@@ -104,6 +105,46 @@ function panCoord(value) {
   return Math.round(clampNumber(number, -2000, 2000))
 }
 
+function petScale(value, fallback) {
+  var number = Number(value)
+  if (!isFinite(number)) return fallback
+  return Math.round(clampNumber(number, 0.5, 2.5) * 100) / 100
+}
+
+function petWalkX(value) {
+  var number = Number(value)
+  if (!isFinite(number)) return 0
+  return Math.round(clampNumber(number, -220, 220))
+}
+
+function petWalkY(value, fallback) {
+  var number = Number(value)
+  if (!isFinite(number)) return fallback
+  return Math.round(clampNumber(number, 360, 600))
+}
+
+function petPath(value) {
+  if (typeof value !== "string") return ""
+  var path = value.trim()
+  if (path.length > 1024 || path.charAt(0) !== "/") return ""
+  if (!/\.(png|webp|jpe?g)$/i.test(path)) return ""
+  return path
+}
+
+function petPathList(value) {
+  if (!Array.isArray(value)) return []
+  var out = []
+  var seen = {}
+  for (var i = 0; i < value.length && out.length < 32; i++) {
+    var path = petPath(value[i])
+    if (path && !seen[path]) {
+      seen[path] = true
+      out.push(path)
+    }
+  }
+  return out
+}
+
 // Single-line LCD text: no newlines/tabs, trimmed, capped. Placeholders
 // ({theme} {liquid} {pump} {fan}) survive untouched for the renderer.
 function lcdText(value) {
@@ -148,6 +189,12 @@ function parse(text) {
       lcdZoom: zoomFactor(raw.lcdZoom, 1),
       lcdPanX: panCoord(raw.lcdPanX),
       lcdPanY: panCoord(raw.lcdPanY),
+      lcdPet: raw.lcdPet === true,
+      lcdPetPath: petPath(raw.lcdPetPath),
+      lcdPetFavorites: petPathList(raw.lcdPetFavorites),
+      lcdPetScale: petScale(raw.lcdPetScale, 1),
+      lcdPetX: petWalkX(raw.lcdPetX),
+      lcdPetY: petWalkY(raw.lcdPetY, 510),
       liquidctlBinary: typeof raw.liquidctlBinary === "string"
         && raw.liquidctlBinary.length > 0
         && raw.liquidctlBinary.length <= 128

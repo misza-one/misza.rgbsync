@@ -28,12 +28,109 @@ Panel {
   property string titleDraft: ""
   property string topDraft: ""
   property string bottomDraft: ""
+  property int petPreviewIndex: 0
+  property string petIdDraft: ""
+  property string petInstallStatus: ""
+  property var installedPets: []
+
+  function localFilePath(url) {
+    var text = String(url || "")
+    if (text.indexOf("file://") === 0) text = text.slice(7)
+    try {
+      return decodeURIComponent(text)
+    } catch (exception) {
+      return text
+    }
+  }
+
+  function displayPetName(path) {
+    for (var i = 0; i < root.installedPets.length; i++) {
+      if (root.installedPets[i].path === path) return root.installedPets[i].name
+    }
+    return root.ready ? root.svc.petName(path) : "—"
+  }
+
+  Timer {
+    interval: 120
+    repeat: true
+    running: root.opened && root.ready && root.svc.lcdPet
+    onTriggered: root.petPreviewIndex = (root.petPreviewIndex + 1) % 8
+  }
+  Process {
+    id: petFilePicker
+    command: [
+      "zenity", "--file-selection", "--title=Choose an OpenPets spritesheet",
+      "--file-filter=Pet spritesheets | *.png *.webp *.jpg *.jpeg"
+    ]
+    stdout: SplitParser {
+      onRead: function(line) {
+        var path = String(line || "").trim()
+        if (path && root.ready) root.svc.setLcdPetPath(path)
+      }
+    }
+  }
+
+  function refreshInstalledPets() {
+    if (!root.ready || petCatalogScanner.running) return
+    root.installedPets = []
+    petCatalogScanner.running = true
+  }
+
+  Process {
+    id: petCatalogScanner
+    command: root.ready
+      ? [root.svc.pluginDir + "/bin/rgbsync-pet-install", "--list"]
+      : []
+    stdout: SplitParser {
+      onRead: function(line) {
+        try {
+          var pet = JSON.parse(String(line || ""))
+          if (!pet.path || !pet.name) return
+          var next = root.installedPets.slice()
+          next.push(pet)
+          root.installedPets = next
+        } catch (exception) {
+          console.warn("rgbsync: bad installed pet record: " + line)
+        }
+      }
+    }
+  }
+
+  Process {
+    id: petCatalogInstaller
+    command: root.ready
+      ? [root.svc.pluginDir + "/bin/rgbsync-pet-install",
+         root.petIdDraft.trim()]
+      : []
+    stdout: SplitParser {
+      onRead: function(line) {
+        var path = String(line || "").trim()
+        if (!path || !root.ready) return
+        root.svc.setLcdPetPath(path)
+        root.svc.addFavoritePet(path)
+        root.petInstallStatus = "Installed, selected, and added to favorites."
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(line) {
+        var message = String(line || "").trim()
+        if (message) root.petInstallStatus = message
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && root.petInstallStatus === "Installing…") {
+        root.petInstallStatus = "OpenPets installation failed."
+      }
+      root.refreshInstalledPets()
+    }
+  }
 
   onOpenedChanged: {
     if (opened && ready) {
       titleDraft = svc.lcdTitle
       topDraft = svc.lcdTop
       bottomDraft = svc.lcdBottom
+      root.refreshInstalledPets()
     }
   }
 
@@ -45,7 +142,8 @@ Panel {
     parts.push(svc.themeDisplayName() + " #" + svc.accentHex())
     parts.push(svc.targetCount + "/" + svc.deviceCount + " devices")
     if (svc.lcdEnabled) parts.push("LCD " + svc.lcdTemp + "C")
-    if (svc.busy) parts.push(svc.lcdPhase !== "idle" ? "LCD " + svc.lcdPhase + "…" : "working…")
+    if (svc.lcdPhase === "stream") parts.push("pet")
+    else if (svc.busy) parts.push(svc.lcdPhase !== "idle" ? "LCD " + svc.lcdPhase + "…" : "working…")
     return parts.join(" · ")
   }
 
@@ -69,6 +167,7 @@ Panel {
         + " devices=" + root.svc.deviceCount
         + " targets=" + root.svc.targetCount
         + " lcd=" + root.svc.lcdEnabled
+        + " pet=" + root.svc.lcdPet
         + " liquid=" + root.svc.lcdTemp + "C pump=" + root.svc.lcdPump
         + " fan=" + root.svc.lcdFan
         + " deps=" + (!root.svc.depsProbed ? "probing"
@@ -245,6 +344,313 @@ Panel {
           foreground: root.fg
           fontFamily: root.family
           onClicked: if (root.ready) root.svc.setLcdWallpaper(!root.svc.lcdWallpaper)
+        }
+
+        Toggle {
+          width: parent.width
+          label: "Animated pet overlay"
+          description: "Walk an OpenPets sprite on the wallpaper (CAM stream)."
+          checked: root.ready && root.svc.lcdPet
+          foreground: root.fg
+          fontFamily: root.family
+          onClicked: if (root.ready) root.svc.toggleLcdPet()
+        }
+
+        Column {
+          width: parent.width
+          visible: root.ready && root.svc.lcdPet
+          spacing: Style.spacing.sm
+
+          PanelSectionHeader {
+            width: parent.width
+            text: "PET LIBRARY"
+            foreground: root.fg
+            fontFamily: root.family
+          }
+
+          Item {
+            id: petPreviewBox
+            width: 144
+            height: 156
+            anchors.horizontalCenter: parent.horizontalCenter
+
+            Rectangle {
+              anchors.fill: parent
+              radius: Style.cornerRadius
+              clip: true
+              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
+              border.color: root.ready && root.svc.isFavoritePet(root.svc.resolvedPetPath())
+                ? root.svc.themeAccent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.25)
+              border.width: 2
+              Image {
+                id: petSheetPreview
+                readonly property int sheetRows:
+                  sourceSize.height > sourceSize.width ? 9 : 3
+                source: root.ready ? "file://" + root.svc.resolvedPetPath() : ""
+                cache: false
+                asynchronous: true
+                smooth: false
+                width: petPreviewBox.width * 8
+                height: petPreviewBox.height * sheetRows
+                x: -root.petPreviewIndex * petPreviewBox.width
+                y: -petPreviewBox.height
+              }
+
+              Text {
+                anchors.centerIn: parent
+                visible: petSheetPreview.status === Image.Error
+                text: "Preview unavailable"
+                color: Color.muted
+                font.family: root.family
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            text: root.displayPetName(root.ready ? root.svc.resolvedPetPath() : "")
+            color: root.fg
+            font.family: root.family
+            font.pixelSize: Style.font.body
+            elide: Text.ElideMiddle
+          }
+
+          Row {
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.spacing.sm
+
+            Button {
+              bordered: true
+              text: "Choose file…"
+              foreground: root.fg
+              fontFamily: root.family
+              onClicked: if (!petFilePicker.running) petFilePicker.running = true
+            }
+
+            Button {
+              bordered: true
+              text: root.ready && root.svc.isFavoritePet(root.svc.resolvedPetPath())
+                ? "★ Favorite" : "☆ Favorite"
+              foreground: root.fg
+              fontFamily: root.family
+              onClicked: if (root.ready) root.svc.toggleFavoritePet()
+            }
+          }
+
+
+          Button {
+            visible: root.ready
+              && root.svc.resolvedPetPath() !== root.svc.bundledPetPath()
+            anchors.horizontalCenter: parent.horizontalCenter
+            bordered: true
+            text: "Use bundled pet"
+            foreground: root.fg
+            fontFamily: root.family
+            onClicked: if (root.ready) root.svc.setLcdPetPath(
+              root.svc.bundledPetPath())
+          }
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            TextField {
+              width: parent.width - installPetButton.implicitWidth
+                - parent.spacing
+              text: root.petIdDraft
+              placeholderText: "OpenPets ID, e.g. gpt-niang"
+              onTextChanged: root.petIdDraft = text
+            }
+
+            Button {
+              id: installPetButton
+              bordered: true
+              text: petCatalogInstaller.running ? "Installing…" : "Install"
+              enabled: !petCatalogInstaller.running
+                && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(root.petIdDraft.trim())
+              foreground: root.fg
+              fontFamily: root.family
+              onClicked: {
+                root.petInstallStatus = "Installing…"
+                petCatalogInstaller.running = true
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            visible: root.petInstallStatus !== ""
+            text: root.petInstallStatus
+            color: Color.muted
+            font.family: root.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+          }
+
+          PanelSectionHeader {
+            width: parent.width
+            visible: root.installedPets.length > 0
+            text: "INSTALLED OPENPETS"
+            foreground: root.fg
+            fontFamily: root.family
+          }
+
+          Repeater {
+            model: root.installedPets
+
+            Row {
+              width: column.width
+              spacing: Style.spacing.sm
+
+              Text {
+                width: parent.width - useInstalled.implicitWidth
+                  - favoriteInstalled.implicitWidth - parent.spacing * 2
+                anchors.verticalCenter: parent.verticalCenter
+                text: modelData.name
+                color: root.ready && modelData.path === root.svc.resolvedPetPath()
+                  ? root.svc.themeAccent : root.fg
+                font.family: root.family
+                font.pixelSize: Style.font.body
+                elide: Text.ElideMiddle
+              }
+
+              Button {
+                id: useInstalled
+                bordered: true
+                text: root.ready && modelData.path === root.svc.resolvedPetPath()
+                  ? "Active" : "Use"
+                enabled: root.ready
+                  && modelData.path !== root.svc.resolvedPetPath()
+                foreground: root.fg
+                fontFamily: root.family
+                onClicked: if (root.ready) root.svc.setLcdPetPath(modelData.path)
+              }
+
+              Button {
+                id: favoriteInstalled
+                bordered: true
+                text: root.ready && root.svc.isFavoritePet(modelData.path)
+                  ? "★" : "☆"
+                foreground: root.fg
+                fontFamily: root.family
+                onClicked: {
+                  if (!root.ready) return
+                  if (root.svc.isFavoritePet(modelData.path)) {
+                    root.svc.removeFavoritePet(modelData.path)
+                  } else {
+                    root.svc.addFavoritePet(modelData.path)
+                  }
+                }
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            visible: root.ready && root.svc.lcdPetFavorites.length === 0
+            text: "Choose any OpenPets 8-column spritesheet, then star it for one-click access."
+            color: Color.muted
+            font.family: root.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+          }
+
+          Repeater {
+            model: root.ready ? root.svc.lcdPetFavorites : []
+
+            Row {
+              width: column.width
+              spacing: Style.spacing.sm
+
+              Text {
+                width: parent.width - useFavorite.implicitWidth
+                  - removeFavorite.implicitWidth - parent.spacing * 2
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.displayPetName(modelData)
+                color: root.ready && modelData === root.svc.resolvedPetPath()
+                  ? root.svc.themeAccent : root.fg
+                font.family: root.family
+                font.pixelSize: Style.font.body
+                elide: Text.ElideMiddle
+              }
+
+              Button {
+                id: useFavorite
+                bordered: true
+                text: modelData === root.svc.resolvedPetPath() ? "Active" : "Use"
+                enabled: modelData !== root.svc.resolvedPetPath()
+                foreground: root.fg
+                fontFamily: root.family
+                onClicked: if (root.ready) root.svc.setLcdPetPath(modelData)
+              }
+
+              Button {
+                id: removeFavorite
+                bordered: true
+                text: "Remove"
+                foreground: root.fg
+                fontFamily: root.family
+                onClicked: if (root.ready) root.svc.removeFavoritePet(modelData)
+              }
+            }
+          }
+        }
+
+        LabeledSlider {
+          width: parent.width
+          visible: root.ready && root.svc.lcdPet
+          bar: root.bar
+          label: "Pet size"
+          minimum: 50
+          maximum: 250
+          step: 5
+          value: root.ready ? root.svc.lcdPetScale * 100 : 100
+          valueText: root.ready ? Math.round(root.svc.lcdPetScale * 100) + "%" : "100%"
+          onMoved: function(value) {
+            if (root.ready) root.svc.setLcdPetScale(value / 100, false)
+          }
+          onReleased: function(value) {
+            if (root.ready) root.svc.setLcdPetScale(value / 100, true)
+          }
+        }
+
+        LabeledSlider {
+          width: parent.width
+          visible: root.ready && root.svc.lcdPet
+          bar: root.bar
+          label: "Walk left/right"
+          minimum: -220
+          maximum: 220
+          step: 5
+          value: root.ready ? root.svc.lcdPetX : 0
+          valueText: root.ready ? Math.round(root.svc.lcdPetX) + " px" : "0 px"
+          onMoved: function(value) {
+            if (root.ready) root.svc.setLcdPetX(value, false)
+          }
+          onReleased: function(value) {
+            if (root.ready) root.svc.setLcdPetX(value, true)
+          }
+        }
+
+        LabeledSlider {
+          width: parent.width
+          visible: root.ready && root.svc.lcdPet
+          bar: root.bar
+          label: "Walk height"
+          minimum: 360
+          maximum: 600
+          step: 5
+          value: root.ready ? root.svc.lcdPetY : 510
+          valueText: root.ready ? Math.round(root.svc.lcdPetY) + " px" : "510 px"
+          onMoved: function(value) {
+            if (root.ready) root.svc.setLcdPetY(value, false)
+          }
+          onReleased: function(value) {
+            if (root.ready) root.svc.setLcdPetY(value, true)
+          }
         }
 
         Toggle {

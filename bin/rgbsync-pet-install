@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Install or list OpenPets catalog pets and print machine-readable results."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+PET_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+def pets_root() -> Path:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_home / "OpenPets" / "pets"
+
+
+def list_pets() -> int:
+    root = pets_root()
+    if not root.is_dir():
+        return 0
+    for directory in sorted(root.iterdir()):
+        spritesheet = directory / "spritesheet.webp"
+        metadata_path = directory / "pet.json"
+        if not directory.is_dir() or not spritesheet.is_file():
+            continue
+        display_name = directory.name
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(metadata.get("displayName"), str):
+                display_name = metadata["displayName"]
+        except (OSError, ValueError, AttributeError):
+            pass
+        print(json.dumps({
+            "id": directory.name,
+            "name": display_name,
+            "path": str(spritesheet),
+        }, ensure_ascii=False))
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--list":
+        return list_pets()
+    pet_id = sys.argv[1].strip() if len(sys.argv) == 2 else ""
+    if not PET_ID.fullmatch(pet_id):
+        print("Pet ID must use lowercase letters, numbers, '-' or '_'.", file=sys.stderr)
+        return 2
+
+    spritesheet = pets_root() / pet_id / "spritesheet.webp"
+    if not spritesheet.is_file():
+        try:
+            result = subprocess.run(
+                ["npx", "-y", "install-pet", pet_id],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        except FileNotFoundError:
+            print("npx is not installed.", file=sys.stderr)
+            return 1
+        if result.returncode != 0 and not spritesheet.is_file():
+            message = result.stdout.strip() or "OpenPets installation failed."
+            print(message, file=sys.stderr)
+            return result.returncode or 1
+
+    if not spritesheet.is_file():
+        print("Installer finished without a spritesheet.", file=sys.stderr)
+        return 1
+    print(spritesheet)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

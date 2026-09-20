@@ -24,8 +24,10 @@ QtObject {
   readonly property string themeNamePath: home + "/.local/state/omarchy/current/theme.name"
   readonly property string backgroundPath: home + "/.local/state/omarchy/current/background"
   readonly property string lcdImagePath: configDir + "/lcd.png"
+  readonly property string lcdPetStatePath: configDir + "/lcd-pet.json"
   // Resolved at startup: packagers put it here, otherwise PATH lookup.
   property string openrgbBinary: "/usr/bin/openrgb"
+  readonly property string keychronBinary: pluginDir + "/bin/rgbsync-keychron"
 
   // The RTX 4090 Suprim X only holds the colour when its single zone is
   // addressed explicitly, and its reported mode stays [Off] either way, so
@@ -55,6 +57,12 @@ QtObject {
   property real lcdZoom: 1
   property real lcdPanX: 0
   property real lcdPanY: 0
+  property bool lcdPet: false
+  property string lcdPetPath: ""
+  property var lcdPetFavorites: []
+  property real lcdPetScale: 1
+  property real lcdPetX: 0
+  property real lcdPetY: 510
   // Live preview state for the wallpaper positioner: updated on every drag
   // move without touching the persisted values, committed on release.
   property real lcdViewZoom: 1
@@ -74,12 +82,13 @@ QtObject {
   property string lcdPump: "--"
   property string lcdFan: "--"
   property string lcdLastKey: ""
-  // idle | brightness | query | render | push — surfaced in the UI so the
-  // slow USB bulk push does not look like a hang.
+  // idle | brightness | query | render | push | stream
   property string lcdPhase: "idle"
+  property bool lcdPetStopping: false
   readonly property bool busy: applyProcess.running || enumProcess.running
-    || lcdStatusProcess.running || lcdRenderProcess.running
-    || lcdPushProcess.running || lcdBrightnessProcess.running
+    || keychronProcess.running || lcdStatusProcess.running
+    || lcdRenderProcess.running || lcdPushProcess.running
+    || lcdBrightnessProcess.running
   readonly property int deviceCount: root.detected.length
   readonly property int targetCount: root.resolveTargets().length
 
@@ -172,6 +181,12 @@ QtObject {
       lcdZoom: root.lcdZoom,
       lcdPanX: root.lcdPanX,
       lcdPanY: root.lcdPanY,
+      lcdPet: root.lcdPet,
+      lcdPetPath: root.lcdPetPath,
+      lcdPetFavorites: root.lcdPetFavorites.slice(),
+      lcdPetScale: root.lcdPetScale,
+      lcdPetX: root.lcdPetX,
+      lcdPetY: root.lcdPetY,
       liquidctlBinary: root.liquidctlBinary
     }
   }
@@ -213,6 +228,12 @@ QtObject {
     root.lcdZoom = config.lcdZoom
     root.lcdPanX = config.lcdPanX
     root.lcdPanY = config.lcdPanY
+    root.lcdPet = config.lcdPet
+    root.lcdPetPath = config.lcdPetPath
+    root.lcdPetFavorites = config.lcdPetFavorites
+    root.lcdPetScale = config.lcdPetScale
+    root.lcdPetX = config.lcdPetX
+    root.lcdPetY = config.lcdPetY
     root.syncLcdView()
     root.liquidctlBinary = config.liquidctlBinary
     root.queueApply()
@@ -346,6 +367,169 @@ QtObject {
 
   function toggleLcd() {
     root.setLcdEnabled(!root.lcdEnabled)
+  }
+
+  function setLcdPet(on) {
+    if (root.lcdPet === on) return
+    root.saveConfig({ lcdPet: on })
+    root.log(on ? "lcd pet enabled" : "lcd pet disabled")
+  }
+
+  function toggleLcdPet() {
+    root.setLcdPet(!root.lcdPet)
+  }
+
+  function bundledPetPath() {
+    return root.pluginDir + "/assets/pet.webp"
+  }
+
+  function resolvedPetPath() {
+    return root.lcdPetPath || root.bundledPetPath()
+  }
+
+  function petName(path) {
+    var parts = String(path || root.bundledPetPath()).split("/")
+    var name = parts.length > 0 ? parts[parts.length - 1] : "pet"
+    return name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ")
+  }
+
+  function setLcdPetPath(path) {
+    var next = String(path || "")
+    if (next === root.bundledPetPath()) next = ""
+    if (next !== "" && (next.charAt(0) !== "/"
+        || !/\.(png|webp|jpe?g)$/i.test(next))) {
+      root.fail("pet", "Choose a PNG, WebP, or JPEG OpenPets spritesheet.")
+      return
+    }
+    root.saveConfig({ lcdPetPath: next, lcdPet: true })
+    root.log("lcd pet -> " + root.petName(next))
+  }
+
+  function isFavoritePet(path) {
+    var wanted = String(path || root.resolvedPetPath())
+    return root.lcdPetFavorites.indexOf(wanted) !== -1
+  }
+
+  function addFavoritePet(path) {
+    var wanted = String(path || root.resolvedPetPath())
+    if (!wanted || root.isFavoritePet(wanted)) return
+    var next = root.lcdPetFavorites.slice()
+    next.push(wanted)
+    root.saveConfig({ lcdPetFavorites: next })
+  }
+
+  function removeFavoritePet(path) {
+    var wanted = String(path || root.resolvedPetPath())
+    var next = []
+    for (var i = 0; i < root.lcdPetFavorites.length; i++) {
+      if (root.lcdPetFavorites[i] !== wanted) next.push(root.lcdPetFavorites[i])
+    }
+    root.saveConfig({ lcdPetFavorites: next })
+  }
+
+  function toggleFavoritePet() {
+    if (root.isFavoritePet(root.resolvedPetPath())) {
+      root.removeFavoritePet(root.resolvedPetPath())
+    } else {
+      root.addFavoritePet(root.resolvedPetPath())
+    }
+  }
+
+  function setLcdPetScale(value, immediate) {
+    var next = Math.round(Math.max(0.5, Math.min(2.5, Number(value))) * 100) / 100
+    if (!isFinite(next)) return
+    if (root.lcdPetScale === next) {
+      if (immediate === true) root.writePetState()
+      return
+    }
+    root.lcdPetScale = next
+    root.writePetState()
+    if (immediate === true) root.saveConfig({ lcdPetScale: next })
+  }
+
+  function setLcdPetX(value, immediate) {
+    var next = Math.round(Math.max(-220, Math.min(220, Number(value))))
+    if (!isFinite(next)) return
+    if (root.lcdPetX === next) {
+      if (immediate === true) root.writePetState()
+      return
+    }
+    root.lcdPetX = next
+    root.writePetState()
+    if (immediate === true) root.saveConfig({ lcdPetX: next })
+  }
+
+  function setLcdPetY(value, immediate) {
+    var next = Math.round(Math.max(360, Math.min(600, Number(value))))
+    if (!isFinite(next)) return
+    if (root.lcdPetY === next) {
+      if (immediate === true) root.writePetState()
+      return
+    }
+    root.lcdPetY = next
+    root.writePetState()
+    if (immediate === true) root.saveConfig({ lcdPetY: next })
+  }
+
+  function writePetState() {
+    var state = {
+      accent: root.accentHex(),
+      title: root.resolvedLcdTitle(),
+      top: root.resolvedLcdTop(),
+      bottom: root.resolvedLcdBottom(),
+      wallpaper: root.lcdWallpaper ? root.backgroundPath : "",
+      dim: root.lcdDim,
+      zoom: root.lcdZoom,
+      panX: Math.round(root.lcdPanX),
+      panY: Math.round(root.lcdPanY),
+      brightness: Math.round(root.lcdBrightness),
+      spritesheet: root.resolvedPetPath(),
+      fps: 10,
+      petScale: root.lcdPetScale,
+      petX: Math.round(root.lcdPetX),
+      petY: Math.round(root.lcdPetY)
+    }
+    lcdPetStateFile.setText(JSON.stringify(state, null, 2) + "\n")
+  }
+
+  function stopLcdPet() {
+    if (!lcdPetProcess.running) return
+    root.lcdPetStopping = true
+    root.log("lcd pet stop")
+    lcdPetProcess.running = false
+  }
+
+  function ensureLcdPet() {
+    if (!root.lcdEnabled || !root.lcdPet) {
+      root.stopLcdPet()
+      return
+    }
+    if (root.depsProbed && (root.depsMissing.indexOf("hid") !== -1
+        || root.depsMissing.indexOf("pyusb") !== -1
+        || root.depsMissing.indexOf("pillow") !== -1
+        || root.depsMissing.indexOf("python3") !== -1)) {
+      root.fail("deps", "LCD pet needs python3, pillow, hid, and pyusb.")
+      return
+    }
+    root.writePetState()
+    if (lcdPetProcess.running) {
+      root.lcdPhase = "stream"
+      return
+    }
+    root.log("lcd pet start")
+    lcdPetProcess.command = ["python3", root.pluginDir + "/bin/rgbsync-lcd-pet",
+      "--state", root.lcdPetStatePath]
+    lcdPetProcess.running = true
+    root.lcdPhase = "stream"
+  }
+
+  function onPetLine(line) {
+    var match = String(line).match(
+      /status liquid=([0-9.]+) pump=([0-9]+) fan=([0-9]+)/)
+    if (!match) return
+    root.lcdTemp = match[1]
+    root.lcdPump = match[2]
+    root.lcdFan = match[3]
   }
 
   function setLcdBrightness(value, immediate) {
@@ -577,6 +761,19 @@ QtObject {
     onTriggered: root.applyNow()
   }
 
+  // Some USB monitors finish their own lighting startup after OpenRGB's first
+  // successful write. Reconcile once after login so that late firmware resets
+  // (notably the Alienware AW3225QF) do not win the startup race.
+  property bool startupReapplyScheduled: false
+  property Timer startupReapplyTimer: Timer {
+    interval: 20000
+    onTriggered: {
+      root.log("startup RGB reconciliation")
+      root.lastAppliedHex = ""
+      root.queueApply()
+    }
+  }
+
   // Coalesced request while a run is in flight.
   property string pendingHex: ""
   // Chain an apply after the running enumeration finishes.
@@ -585,6 +782,9 @@ QtObject {
   property string appliedHex: ""
   property bool applyRetried: false
   property string applyStderr: ""
+  property string lastKeychronHex: ""
+  property string pendingKeychronHex: ""
+  property string keychronStderr: ""
 
   function queueApply() {
     if (!root.enabled) return
@@ -594,6 +794,7 @@ QtObject {
   function applyNow() {
     if (!root.enabled) return
     var hex = root.accentHex()
+    root.applyKeychron(hex)
     if (hex === root.lastAppliedHex && root.detected.length > 0) return
     if (applyProcess.running) {
       root.pendingHex = hex
@@ -647,10 +848,49 @@ QtObject {
       root.lastError = ""
       root.lastErrorKind = ""
       root.log("applied #" + root.lastAppliedHex)
+      if (!root.startupReapplyScheduled) {
+        root.startupReapplyScheduled = true
+        startupReapplyTimer.start()
+      }
       if (root.pendingHex !== "") {
         var next = root.pendingHex
         root.pendingHex = ""
         if (next !== root.lastAppliedHex) root.applyNow()
+      }
+    }
+  }
+
+  function applyKeychron(hex) {
+    if (hex === root.lastKeychronHex) return
+    if (keychronProcess.running) {
+      root.pendingKeychronHex = hex
+      return
+    }
+    root.keychronStderr = ""
+    keychronProcess.command = [root.keychronBinary, hex]
+    keychronProcess.running = true
+  }
+
+  property Process keychronProcess: Process {
+    stdout: SplitParser {
+      onRead: function(value) {}
+    }
+    stderr: SplitParser {
+      onRead: function(value) {
+        root.keychronStderr = (root.keychronStderr + value + "\n").slice(-500)
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.lastKeychronHex = root.accentHex()
+        root.log("Keychron applied #" + root.lastKeychronHex)
+      } else if (root.keychronStderr !== "") {
+        root.log(root.keychronStderr.trim().split("\n").pop())
+      }
+      if (root.pendingKeychronHex !== "") {
+        var next = root.pendingKeychronHex
+        root.pendingKeychronHex = ""
+        root.applyKeychron(next)
       }
     }
   }
@@ -674,6 +914,12 @@ QtObject {
     if (key === "python3") {
       return "python3 not found — needed to render the LCD image."
     }
+    if (key === "hid") {
+      return "python hid not found — pip install hid (LCD pet stream)."
+    }
+    if (key === "pyusb") {
+      return "pyusb not found — pip install pyusb (LCD pet stream)."
+    }
     return "python-pillow not found — install python-pillow to render the LCD image."
   }
 
@@ -685,7 +931,9 @@ QtObject {
         fallback: "openrgb" },
       { key: "liquidctl", program: root.liquidctlBinary, args: ["--version"] },
       { key: "python3", program: "python3", args: ["--version"] },
-      { key: "pillow", program: "python3", args: ["-c", "import PIL"] }
+      { key: "pillow", program: "python3", args: ["-c", "import PIL"] },
+      { key: "hid", program: "python3", args: ["-c", "import hid"] },
+      { key: "pyusb", program: "python3", args: ["-c", "import usb.core"] }
     ]
     root.log("probing dependencies")
     root.probeNext()
@@ -732,6 +980,7 @@ QtObject {
       root.depsMissing.push(item.key)
       var relevant = item.key === "openrgb" ? root.enabled
         : item.key === "python3" ? (root.enabled || root.lcdEnabled)
+        : (item.key === "hid" || item.key === "pyusb") ? (root.lcdEnabled && root.lcdPet)
         : root.lcdEnabled
       if (relevant) root.fail("deps", root.depsHint(item.key))
       else root.log("missing but unused: " + item.key)
@@ -767,6 +1016,35 @@ QtObject {
   // ------------------------------------------------------------ enumerate
 
   property string enumOutput: ""
+  property int serverWarmupPasses: 0
+
+  property Process openrgbServerProcess: Process {
+    command: [root.openrgbBinary, "--server", "--server-host", "127.0.0.1",
+              "--server-port", "6742", "--noautoconnect"]
+    stdout: SplitParser {
+      onRead: function(value) {}
+    }
+    stderr: SplitParser {
+      onRead: function(value) {}
+    }
+    onExited: function(exitCode) {
+      root.log("OpenRGB server exited (code " + exitCode
+               + "); CLI fallback remains available")
+    }
+  }
+
+  // OpenRGB exposes its SDK port before asynchronous hardware discovery is
+  // complete. Cheap client enumerations pick up devices as they appear, so
+  // normal theme changes never repeat the 18–40 second hardware scan.
+  property Timer serverWarmupTimer: Timer {
+    interval: 1500
+    repeat: true
+    onTriggered: {
+      root.serverWarmupPasses += 1
+      root.enumerate()
+      if (root.serverWarmupPasses >= 16) stop()
+    }
+  }
 
   function enumerate() {
     if (enumProcess.running) return
@@ -784,9 +1062,14 @@ QtObject {
     }
     onExited: function(exitCode) {
       if (exitCode === 0) {
+        var previousCount = root.detected.length
         root.detected = root.parseDevices(root.enumOutput)
         root.log("detected " + root.detected.length + " OpenRGB device(s)")
-        if (root.detected.length === 0) {
+        if (root.detected.length !== previousCount && root.enabled) {
+          root.lastAppliedHex = ""
+          root.applyAfterEnum = true
+        }
+        if (root.detected.length === 0 && !serverWarmupTimer.running) {
           root.fail("devices", "OpenRGB found no devices.")
         }
       } else {
@@ -808,7 +1091,10 @@ QtObject {
     onTriggered: {
       root.log("refresh tick")
       if (root.enabled) root.applyNow()
-      if (root.lcdEnabled) root.lcdCycle()
+      if (root.lcdEnabled) {
+        if (root.lcdPet) root.writePetState()
+        else root.lcdCycle()
+      }
     }
   }
 
@@ -826,7 +1112,19 @@ QtObject {
   property string lcdPushStderr: ""
 
   function queueLcd() {
-    if (!root.lcdEnabled) return
+    if (!root.lcdEnabled) {
+      root.stopLcdPet()
+      return
+    }
+    if (root.lcdPet) {
+      if (root.lcdBusy()) {
+        root.lcdPending = true
+        return
+      }
+      root.ensureLcdPet()
+      return
+    }
+    root.stopLcdPet()
     lcdDebounce.restart()
   }
 
@@ -863,6 +1161,10 @@ QtObject {
 
   function lcdCycle() {
     if (!root.lcdEnabled) return
+    if (root.lcdPet) {
+      root.ensureLcdPet()
+      return
+    }
     if (root.lcdBusy()) {
       root.lcdPending = true
       return
@@ -1001,8 +1303,38 @@ QtObject {
     }
   }
 
+
+  property FileView lcdPetStateFile: FileView {
+    path: root.lcdPetStatePath
+    printErrors: false
+    atomicWrites: true
+  }
+
+  property Process lcdPetProcess: Process {
+    stdout: SplitParser {
+      onRead: function(value) { root.onPetLine(value) }
+    }
+    stderr: SplitParser {
+      onRead: function(value) { root.log("lcd-pet: " + value) }
+    }
+    onExited: function(exitCode) {
+      if (root.lcdPhase === "stream") root.lcdPhase = "idle"
+      var stopping = root.lcdPetStopping
+      root.lcdPetStopping = false
+      if (stopping) {
+        if (root.lcdEnabled && !root.lcdPet) root.queueLcd()
+        return
+      }
+      if (exitCode !== 0 && root.lcdEnabled && root.lcdPet) {
+        root.fail("lcd", "LCD pet streamer exited (code " + exitCode + ").")
+      }
+    }
+  }
+
   Component.onCompleted: {
     root.configDirProcess.running = true
+    openrgbServerProcess.running = true
+    serverWarmupTimer.start()
     // Probes gate enumeration: a missing openrgb fails here with a readable
     // hint instead of a bare device-scan error. Config may load after this.
     root.startDepsProbe()
