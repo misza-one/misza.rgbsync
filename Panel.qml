@@ -30,8 +30,14 @@ Panel {
   property string bottomDraft: ""
   property int petPreviewIndex: 0
   property string petIdDraft: ""
+  property string petSearchDraft: ""
   property string petInstallStatus: ""
+  property string petRemoveId: ""
   property var installedPets: []
+  property var catalogPets: []
+  property bool petSearchPending: false
+  property bool installedPetsExpanded: false
+  property bool petActionsExpanded: false
 
   function localFilePath(url) {
     var text = String(url || "")
@@ -50,11 +56,93 @@ Panel {
     return root.ready ? root.svc.petName(path) : "—"
   }
 
+  function installedPetPath(id) {
+    for (var i = 0; i < root.installedPets.length; i++) {
+      if (root.installedPets[i].id === id) return root.installedPets[i].path
+    }
+    return ""
+  }
+
+  function isInstalledPetPath(path) {
+    for (var i = 0; i < root.installedPets.length; i++) {
+      if (root.installedPets[i].path === path) return true
+    }
+    return false
+  }
+
+  function localFavoritePets() {
+    var out = []
+    if (!root.ready) return out
+    for (var i = 0; i < root.svc.lcdPetFavorites.length; i++) {
+      var path = root.svc.lcdPetFavorites[i]
+      if (!root.isInstalledPetPath(path)) out.push(path)
+    }
+    return out
+  }
+
+  function orderedInstalledPets() {
+    var pets = root.installedPets.slice()
+    if (!root.ready) return pets
+    var active = root.svc.resolvedPetPath()
+    var recent = root.svc.lcdPetFavorites
+    pets.sort(function(a, b) {
+      if (a.path === active) return -1
+      if (b.path === active) return 1
+      var ai = recent.indexOf(a.path)
+      var bi = recent.indexOf(b.path)
+      if (ai === -1) ai = 100000
+      if (bi === -1) bi = 100000
+      if (ai !== bi) return ai - bi
+      return String(a.name).localeCompare(String(b.name))
+    })
+    return pets
+  }
+
+
+  function previewPetRow() {
+    if (!root.ready || root.svc.lcdPetMood === "idle") return 1
+    if (root.svc.lcdPetMood === "blocked") return 6
+    if (root.svc.lcdPetMood === "done") return 3
+    if (root.svc.lcdPetMood === "working") return 8
+    return 1
+  }
+
+  function previewPetFrameCount() {
+    if (!root.ready) return 8
+    if (root.svc.lcdPetMood === "done") return 5
+    if (root.svc.lcdPetMood === "blocked") return 6
+    return 8
+  }
+
+  function searchPets() {
+    if (!root.ready) return
+    if (petCatalogSearch.running) {
+      root.petSearchPending = true
+      return
+    }
+    root.petSearchPending = false
+    root.catalogPets = []
+    root.petInstallStatus = root.petSearchDraft.trim() === ""
+      ? "Loading featured pets…" : "Searching OpenPets…"
+    petCatalogSearch.command = [
+      root.svc.pluginDir + "/bin/rgbsync-pet-install",
+      "--search", root.petSearchDraft.trim()
+    ]
+    petCatalogSearch.running = true
+  }
+
+  Timer {
+    id: petSearchDebounce
+    interval: 280
+    onTriggered: root.searchPets()
+  }
+
   Timer {
     interval: 120
     repeat: true
     running: root.opened && root.ready && root.svc.lcdPet
-    onTriggered: root.petPreviewIndex = (root.petPreviewIndex + 1) % 8
+    onTriggered: root.petPreviewIndex =
+      (root.petPreviewIndex + 1) % root.previewPetFrameCount()
   }
   Process {
     id: petFilePicker
@@ -97,6 +185,39 @@ Panel {
   }
 
   Process {
+    id: petCatalogSearch
+    stdout: SplitParser {
+      onRead: function(line) {
+        try {
+          var pet = JSON.parse(String(line || ""))
+          if (!pet.id || !pet.name) return
+          var next = root.catalogPets.slice()
+          next.push(pet)
+          root.catalogPets = next
+        } catch (exception) {
+          console.warn("rgbsync: bad catalog pet record: " + line)
+        }
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(line) {
+        var message = String(line || "").trim()
+        if (message) root.petInstallStatus = message
+      }
+    }
+    onExited: function(exitCode) {
+      if (root.petSearchPending) {
+        root.searchPets()
+        return
+      }
+      if (exitCode === 0) {
+        root.petInstallStatus = root.catalogPets.length > 0
+          ? "" : "No pets match that search."
+      }
+    }
+  }
+
+  Process {
     id: petCatalogInstaller
     command: root.ready
       ? [root.svc.pluginDir + "/bin/rgbsync-pet-install",
@@ -122,6 +243,30 @@ Panel {
         root.petInstallStatus = "OpenPets installation failed."
       }
       root.refreshInstalledPets()
+      root.searchPets()
+    }
+  }
+
+  Process {
+    id: petCatalogRemover
+    command: root.ready
+      ? [root.svc.pluginDir + "/bin/rgbsync-pet-install",
+         "--remove", root.petRemoveId]
+      : []
+    stdout: SplitParser {
+      onRead: function(line) {}
+    }
+    stderr: SplitParser {
+      onRead: function(line) {
+        var message = String(line || "").trim()
+        if (message) root.petInstallStatus = message
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) root.petInstallStatus = "Pet removed."
+      root.petRemoveId = ""
+      root.refreshInstalledPets()
+      root.searchPets()
     }
   }
 
@@ -131,6 +276,7 @@ Panel {
       topDraft = svc.lcdTop
       bottomDraft = svc.lcdBottom
       root.refreshInstalledPets()
+      root.searchPets()
     }
   }
 
@@ -158,6 +304,14 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
+
+    function pets(): void {
+      root.open()
+      Qt.callLater(function() {
+        scroll.contentItem.contentY = Math.max(0, petLibrary.y - Style.space(8))
+      })
+    }
+
 
     function status(): string {
       if (!root.ready) return "service: UNREACHABLE"
@@ -357,124 +511,262 @@ Panel {
         }
 
         Column {
+          id: petLibrary
           width: parent.width
-          visible: root.ready && root.svc.lcdPet
+          visible: root.ready
           spacing: Style.spacing.sm
 
           PanelSectionHeader {
             width: parent.width
-            text: "PET LIBRARY"
+            text: "PET"
             foreground: root.fg
             fontFamily: root.family
           }
 
-          Item {
-            id: petPreviewBox
-            width: 144
-            height: 156
-            anchors.horizontalCenter: parent.horizontalCenter
-
-            Rectangle {
-              anchors.fill: parent
-              radius: Style.cornerRadius
-              clip: true
-              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
-              border.color: root.ready && root.svc.isFavoritePet(root.svc.resolvedPetPath())
-                ? root.svc.themeAccent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.25)
-              border.width: 2
-              Image {
-                id: petSheetPreview
-                readonly property int sheetRows:
-                  sourceSize.height > sourceSize.width ? 9 : 3
-                source: root.ready ? "file://" + root.svc.resolvedPetPath() : ""
-                cache: false
-                asynchronous: true
-                smooth: false
-                width: petPreviewBox.width * 8
-                height: petPreviewBox.height * sheetRows
-                x: -root.petPreviewIndex * petPreviewBox.width
-                y: -petPreviewBox.height
-              }
-
-              Text {
-                anchors.centerIn: parent
-                visible: petSheetPreview.status === Image.Error
-                text: "Preview unavailable"
-                color: Color.muted
-                font.family: root.family
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-
-          Text {
+          Rectangle {
             width: parent.width
-            horizontalAlignment: Text.AlignHCenter
-            text: root.displayPetName(root.ready ? root.svc.resolvedPetPath() : "")
-            color: root.fg
-            font.family: root.family
-            font.pixelSize: Style.font.body
-            elide: Text.ElideMiddle
-          }
+            height: 116
+            radius: Style.cornerRadius
+            color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.055)
+            border.color: Qt.rgba(root.svc.themeAccent.r, root.svc.themeAccent.g,
+                                  root.svc.themeAccent.b, 0.45)
 
-          Row {
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.spacing.sm
+            Row {
+              anchors.fill: parent
+              anchors.margins: Style.spacing.sm
+              spacing: Style.spacing.sm
 
-            Button {
-              bordered: true
-              text: "Choose file…"
-              foreground: root.fg
-              fontFamily: root.family
-              onClicked: if (!petFilePicker.running) petFilePicker.running = true
+              Rectangle {
+                id: petPreviewBox
+                width: 88
+                height: 96
+                anchors.verticalCenter: parent.verticalCenter
+                radius: Style.cornerRadius
+                clip: true
+                color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
+
+                Image {
+                  id: petSheetPreview
+                  readonly property int sheetRows:
+                    sourceSize.height > sourceSize.width ? 9 : 3
+                  readonly property real frameWidth: 72
+                  readonly property real frameHeight: 96
+                  source: "file://" + root.svc.resolvedPetPath()
+                  cache: false
+                  asynchronous: true
+                  smooth: false
+                  width: frameWidth * 8
+                  height: frameHeight * sheetRows
+                  x: (petPreviewBox.width - frameWidth) / 2
+                    - root.petPreviewIndex * frameWidth
+                  y: -(sheetRows >= 9 ? root.previewPetRow() : 1) * frameHeight
+                }
+
+                Text {
+                  anchors.centerIn: parent
+                  visible: petSheetPreview.status === Image.Error
+                  text: "No preview"
+                  color: Color.muted
+                  font.family: root.family
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Column {
+                width: parent.width - petPreviewBox.width - parent.spacing
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.spacing.xs
+
+                Text {
+                  width: parent.width
+                  text: root.displayPetName(root.svc.resolvedPetPath())
+                  color: root.fg
+                  font.family: root.family
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  text: root.svc.lcdPetReactToOmaherd
+                    ? root.svc.lcdPetMoodLabel : "Walking"
+                  color: root.svc.lcdPetMood === "blocked"
+                    ? Color.urgent : Color.muted
+                  font.family: root.family
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+
+                Button {
+                  bordered: false
+                  text: root.petActionsExpanded ? "Hide options" : "More…"
+                  foreground: root.fg
+                  fontFamily: root.family
+                  onClicked: root.petActionsExpanded = !root.petActionsExpanded
+                }
+
+                Row {
+                  visible: root.petActionsExpanded
+                  spacing: Style.spacing.xs
+
+                  Button {
+                    bordered: true
+                    text: "Choose file…"
+                    foreground: root.fg
+                    fontFamily: root.family
+                    onClicked: if (!petFilePicker.running) petFilePicker.running = true
+                  }
+
+                  Button {
+                    visible: !root.isInstalledPetPath(root.svc.resolvedPetPath())
+                      && root.svc.resolvedPetPath() !== root.svc.bundledPetPath()
+                    bordered: true
+                    text: root.svc.isFavoritePet(root.svc.resolvedPetPath())
+                      ? "Saved" : "Save"
+                    foreground: root.fg
+                    fontFamily: root.family
+                    onClicked: root.svc.toggleFavoritePet()
+                  }
+
+                  Button {
+                    visible: root.svc.resolvedPetPath() !== root.svc.bundledPetPath()
+                    bordered: true
+                    text: "Reset pet"
+                    foreground: root.fg
+                    fontFamily: root.family
+                    onClicked: {
+                      root.svc.setLcdPetPath(root.svc.bundledPetPath())
+                      root.petActionsExpanded = false
+                    }
+                  }
+                }
+              }
             }
-
-            Button {
-              bordered: true
-              text: root.ready && root.svc.isFavoritePet(root.svc.resolvedPetPath())
-                ? "★ Favorite" : "☆ Favorite"
-              foreground: root.fg
-              fontFamily: root.family
-              onClicked: if (root.ready) root.svc.toggleFavoritePet()
-            }
           }
-
 
           Button {
-            visible: root.ready
-              && root.svc.resolvedPetPath() !== root.svc.bundledPetPath()
-            anchors.horizontalCenter: parent.horizontalCenter
-            bordered: true
-            text: "Use bundled pet"
+            width: parent.width
+            visible: root.installedPets.length > 0
+            bordered: false
+            text: (root.installedPetsExpanded ? "▾  " : "›  ")
+              + "MY PETS · " + root.installedPets.length
             foreground: root.fg
             fontFamily: root.family
-            onClicked: if (root.ready) root.svc.setLcdPetPath(
-              root.svc.bundledPetPath())
+            onClicked: root.installedPetsExpanded = !root.installedPetsExpanded
           }
+
+          Repeater {
+            model: root.installedPetsExpanded ? root.orderedInstalledPets() : []
+
+            Rectangle {
+              width: column.width
+              height: 54
+              radius: Style.cornerRadius
+              color: modelData.path === root.svc.resolvedPetPath()
+                ? Qt.rgba(root.svc.themeAccent.r, root.svc.themeAccent.g,
+                          root.svc.themeAccent.b, 0.10)
+                : "transparent"
+
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.spacing.xs
+                spacing: Style.spacing.xs
+
+                Rectangle {
+                  id: installedPreview
+                  width: 44
+                  height: 44
+                  anchors.verticalCenter: parent.verticalCenter
+                  radius: Style.cornerRadius
+                  color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)
+
+                  Image {
+                    anchors.fill: parent
+                    anchors.margins: 2
+                    source: modelData.thumbnail
+                      ? "file://" + modelData.thumbnail : ""
+                    asynchronous: true
+                    fillMode: Image.PreserveAspectFit
+                    smooth: false
+                  }
+                }
+
+                Text {
+                  width: parent.width - installedPreview.width
+                    - useInstalled.implicitWidth - deleteInstalled.implicitWidth
+                    - parent.spacing * 3
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.name
+                  color: modelData.path === root.svc.resolvedPetPath()
+                    ? root.svc.themeAccent : root.fg
+                  font.family: root.family
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+
+                Button {
+                  id: useInstalled
+                  anchors.verticalCenter: parent.verticalCenter
+                  bordered: true
+                  text: modelData.path === root.svc.resolvedPetPath() ? "Active" : "Use"
+                  enabled: modelData.path !== root.svc.resolvedPetPath()
+                  foreground: root.fg
+                  fontFamily: root.family
+                  onClicked: root.svc.setLcdPetPath(modelData.path)
+                }
+
+                Button {
+                  id: deleteInstalled
+                  anchors.verticalCenter: parent.verticalCenter
+                  bordered: true
+                  text: "Delete"
+                  enabled: !petCatalogRemover.running
+                  foreground: root.fg
+                  fontFamily: root.family
+                  onClicked: {
+                    if (petCatalogRemover.running) return
+                    if (modelData.path === root.svc.resolvedPetPath()) {
+                      root.svc.setLcdPetPath(root.svc.bundledPetPath())
+                    }
+                    root.svc.removeFavoritePet(modelData.path)
+                    root.petRemoveId = modelData.id
+                    root.petInstallStatus = "Removing " + modelData.name + "…"
+                    petCatalogRemover.running = true
+                  }
+                }
+              }
+            }
+          }
+
           Row {
             width: parent.width
-            spacing: Style.spacing.sm
+            spacing: Style.spacing.xs
 
-            TextField {
-              width: parent.width - installPetButton.implicitWidth
-                - parent.spacing
-              text: root.petIdDraft
-              placeholderText: "OpenPets ID, e.g. gpt-niang"
-              onTextChanged: root.petIdDraft = text
+            PanelSectionHeader {
+              width: parent.width - openPetsLink.implicitWidth - parent.spacing
+              text: "FIND A PET"
+              foreground: root.fg
+              fontFamily: root.family
             }
 
             Button {
-              id: installPetButton
-              bordered: true
-              text: petCatalogInstaller.running ? "Installing…" : "Install"
-              enabled: !petCatalogInstaller.running
-                && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(root.petIdDraft.trim())
-              foreground: root.fg
+              id: openPetsLink
+              bordered: false
+              text: "openpets.dev ↗"
+              foreground: root.svc.themeAccent
               fontFamily: root.family
-              onClicked: {
-                root.petInstallStatus = "Installing…"
-                petCatalogInstaller.running = true
-              }
+              onClicked: Qt.openUrlExternally("https://openpets.dev")
+            }
+          }
+
+          TextField {
+            width: parent.width
+            text: root.petSearchDraft
+            placeholderText: "Search by name, character, or style…"
+            onTextChanged: {
+              root.petSearchDraft = text
+              petSearchDebounce.restart()
             }
           }
 
@@ -486,95 +778,115 @@ Panel {
             font.family: root.family
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
-            horizontalAlignment: Text.AlignHCenter
-          }
-
-          PanelSectionHeader {
-            width: parent.width
-            visible: root.installedPets.length > 0
-            text: "INSTALLED OPENPETS"
-            foreground: root.fg
-            fontFamily: root.family
           }
 
           Repeater {
-            model: root.installedPets
+            model: root.catalogPets
 
-            Row {
+            Rectangle {
               width: column.width
-              spacing: Style.spacing.sm
+              height: 58
+              radius: Style.cornerRadius
+              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.035)
 
-              Text {
-                width: parent.width - useInstalled.implicitWidth
-                  - favoriteInstalled.implicitWidth - parent.spacing * 2
-                anchors.verticalCenter: parent.verticalCenter
-                text: modelData.name
-                color: root.ready && modelData.path === root.svc.resolvedPetPath()
-                  ? root.svc.themeAccent : root.fg
-                font.family: root.family
-                font.pixelSize: Style.font.body
-                elide: Text.ElideMiddle
-              }
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.spacing.xs
+                spacing: Style.spacing.sm
 
-              Button {
-                id: useInstalled
-                bordered: true
-                text: root.ready && modelData.path === root.svc.resolvedPetPath()
-                  ? "Active" : "Use"
-                enabled: root.ready
-                  && modelData.path !== root.svc.resolvedPetPath()
-                foreground: root.fg
-                fontFamily: root.family
-                onClicked: if (root.ready) root.svc.setLcdPetPath(modelData.path)
-              }
+                Image {
+                  width: 44
+                  height: 44
+                  anchors.verticalCenter: parent.verticalCenter
+                  source: modelData.thumbnail
+                  asynchronous: true
+                  fillMode: Image.PreserveAspectFit
+                  smooth: false
+                }
 
-              Button {
-                id: favoriteInstalled
-                bordered: true
-                text: root.ready && root.svc.isFavoritePet(modelData.path)
-                  ? "★" : "☆"
-                foreground: root.fg
-                fontFamily: root.family
-                onClicked: {
-                  if (!root.ready) return
-                  if (root.svc.isFavoritePet(modelData.path)) {
-                    root.svc.removeFavoritePet(modelData.path)
-                  } else {
-                    root.svc.addFavoritePet(modelData.path)
+                Column {
+                  width: parent.width - 44 - catalogInstall.implicitWidth
+                    - parent.spacing * 2
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: 1
+
+                  Text {
+                    width: parent.width
+                    text: modelData.name
+                    color: root.fg
+                    font.family: root.family
+                    font.pixelSize: Style.font.body
+                    font.bold: modelData.featured === true
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    width: parent.width
+                    text: (root.installedPetPath(modelData.id) !== ""
+                        ? "Installed · " : "")
+                      + (modelData.original ? "Original · " : "")
+                      + (modelData.subcategory || modelData.category || "OpenPets")
+                    color: Color.muted
+                    font.family: root.family
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+
+                Button {
+                  id: catalogInstall
+                  anchors.verticalCenter: parent.verticalCenter
+                  bordered: true
+                  readonly property string installedPath:
+                    root.installedPetPath(modelData.id)
+                  text: installedPath !== ""
+                    ? (installedPath === root.svc.resolvedPetPath() ? "Active" : "Use")
+                    : (petCatalogInstaller.running
+                        && root.petIdDraft === modelData.id ? "Installing…" : "Install")
+                  enabled: !petCatalogInstaller.running
+                    && installedPath !== root.svc.resolvedPetPath()
+                  foreground: root.fg
+                  fontFamily: root.family
+                  onClicked: {
+                    if (installedPath !== "") {
+                      root.svc.setLcdPetPath(installedPath)
+                      return
+                    }
+                    root.petIdDraft = modelData.id
+                    root.petInstallStatus = "Installing " + modelData.name + "…"
+                    petCatalogInstaller.running = true
                   }
                 }
               }
             }
           }
 
-          Text {
+
+          PanelSectionHeader {
             width: parent.width
-            visible: root.ready && root.svc.lcdPetFavorites.length === 0
-            text: "Choose any OpenPets 8-column spritesheet, then star it for one-click access."
-            color: Color.muted
-            font.family: root.family
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-            horizontalAlignment: Text.AlignHCenter
+            visible: root.localFavoritePets().length > 0
+            text: "SAVED FILES"
+            foreground: root.fg
+            fontFamily: root.family
           }
 
           Repeater {
-            model: root.ready ? root.svc.lcdPetFavorites : []
+            model: root.localFavoritePets()
 
             Row {
               width: column.width
-              spacing: Style.spacing.sm
+              spacing: Style.spacing.xs
 
               Text {
                 width: parent.width - useFavorite.implicitWidth
                   - removeFavorite.implicitWidth - parent.spacing * 2
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.displayPetName(modelData)
-                color: root.ready && modelData === root.svc.resolvedPetPath()
+                color: modelData === root.svc.resolvedPetPath()
                   ? root.svc.themeAccent : root.fg
                 font.family: root.family
                 font.pixelSize: Style.font.body
-                elide: Text.ElideMiddle
+                elide: Text.ElideRight
               }
 
               Button {
@@ -584,18 +896,33 @@ Panel {
                 enabled: modelData !== root.svc.resolvedPetPath()
                 foreground: root.fg
                 fontFamily: root.family
-                onClicked: if (root.ready) root.svc.setLcdPetPath(modelData)
+                onClicked: root.svc.setLcdPetPath(modelData)
               }
 
               Button {
                 id: removeFavorite
                 bordered: true
-                text: "Remove"
+                text: "Forget"
                 foreground: root.fg
                 fontFamily: root.family
-                onClicked: if (root.ready) root.svc.removeFavoritePet(modelData)
+                onClicked: root.svc.removeFavoritePet(modelData)
               }
             }
+          }
+        }
+
+        Toggle {
+          width: parent.width
+          visible: root.ready && root.svc.lcdPet
+          label: "React to Omaherd agents"
+          description: root.ready
+            ? root.svc.lcdPetMoodLabel
+            : "Waiting, working, and completed agents change the animation."
+          checked: root.ready && root.svc.lcdPetReactToOmaherd
+          foreground: root.fg
+          fontFamily: root.family
+          onClicked: if (root.ready) {
+            root.svc.setLcdPetReactToOmaherd(!root.svc.lcdPetReactToOmaherd)
           }
         }
 
@@ -617,23 +944,6 @@ Panel {
           }
         }
 
-        LabeledSlider {
-          width: parent.width
-          visible: root.ready && root.svc.lcdPet
-          bar: root.bar
-          label: "Walk left/right"
-          minimum: -220
-          maximum: 220
-          step: 5
-          value: root.ready ? root.svc.lcdPetX : 0
-          valueText: root.ready ? Math.round(root.svc.lcdPetX) + " px" : "0 px"
-          onMoved: function(value) {
-            if (root.ready) root.svc.setLcdPetX(value, false)
-          }
-          onReleased: function(value) {
-            if (root.ready) root.svc.setLcdPetX(value, true)
-          }
-        }
 
         LabeledSlider {
           width: parent.width
@@ -754,7 +1064,8 @@ Panel {
               Image {
                 id: wpImage
                 source: root.ready
-                  ? "file://" + root.svc.backgroundPath + "?theme=" + root.svc.currentThemeName
+                  ? "file://" + root.svc.backgroundPath + "?theme="
+                    + root.svc.currentThemeName + "&revision=" + root.svc.backgroundRevision
                   : ""
                 cache: false
                 asynchronous: true

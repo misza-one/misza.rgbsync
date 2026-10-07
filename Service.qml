@@ -63,6 +63,10 @@ QtObject {
   property real lcdPetScale: 1
   property real lcdPetX: 0
   property real lcdPetY: 510
+  property bool lcdPetReactToOmaherd: true
+  property string lcdPetMood: "idle"
+  property string lcdPetMoodLabel: "No active agents"
+  property bool omaherdAvailable: false
   // Live preview state for the wallpaper positioner: updated on every drag
   // move without touching the persisted values, committed on release.
   property real lcdViewZoom: 1
@@ -74,6 +78,7 @@ QtObject {
   readonly property color themeAccent: Color.accent
 
   // [{ index: int, name: string }] from the last enumeration.
+  property int backgroundRevision: 0
   property var detected: []
   property string lastAppliedHex: ""
   property string lastError: ""
@@ -117,6 +122,19 @@ QtObject {
     onLoaded: root.applyThemeName(text())
     onLoadFailed: root.applyThemeName("")
     onFileChanged: reload()
+  }
+
+  property FileView backgroundFile: FileView {
+    path: root.backgroundPath
+    preload: false
+    watchChanges: true
+    printErrors: false
+    onFileChanged: {
+      root.backgroundRevision += 1
+      root.log("background changed")
+      if (root.lcdPet) root.writePetState()
+      else root.queueLcd()
+    }
   }
 
   function normalizedThemeName(value) {
@@ -187,6 +205,7 @@ QtObject {
       lcdPetScale: root.lcdPetScale,
       lcdPetX: root.lcdPetX,
       lcdPetY: root.lcdPetY,
+      lcdPetReactToOmaherd: root.lcdPetReactToOmaherd,
       liquidctlBinary: root.liquidctlBinary
     }
   }
@@ -234,6 +253,7 @@ QtObject {
     root.lcdPetScale = config.lcdPetScale
     root.lcdPetX = config.lcdPetX
     root.lcdPetY = config.lcdPetY
+    root.lcdPetReactToOmaherd = config.lcdPetReactToOmaherd
     root.syncLcdView()
     root.liquidctlBinary = config.liquidctlBinary
     root.queueApply()
@@ -379,6 +399,51 @@ QtObject {
     root.setLcdPet(!root.lcdPet)
   }
 
+  function setLcdPetReactToOmaherd(on) {
+    var next = on === true
+    if (root.lcdPetReactToOmaherd === next) return
+    root.saveConfig({ lcdPetReactToOmaherd: next })
+    if (next) root.refreshOmaherd()
+    else root.applyPetMood("idle", "Reactions off", false)
+  }
+
+  function applyPetMood(mood, label, available) {
+    var next = /^(blocked|done|working|idle)$/.test(mood) ? mood : "idle"
+    var changed = root.lcdPetMood !== next
+      || root.lcdPetMoodLabel !== label
+      || root.omaherdAvailable !== available
+    root.lcdPetMood = next
+    root.lcdPetMoodLabel = String(label || "No active agents")
+    root.omaherdAvailable = available === true
+    if (changed && root.lcdPet) root.writePetState()
+  }
+
+  function refreshOmaherd() {
+    if (!root.lcdPetReactToOmaherd || omaherdStatusProcess.running) return
+    omaherdStatusProcess.command = [
+      "omarchy-shell", "io.github.salemsayed.omaherd", "status"
+    ]
+    omaherdStatusProcess.running = true
+  }
+
+  function applyOmaherdStatus(line) {
+    try {
+      var status = JSON.parse(String(line || ""))
+      var counts = status && status.counts ? status.counts : {}
+      if (Number(counts.blocked || 0) > 0) {
+        root.applyPetMood("blocked", counts.blocked + " need input", true)
+      } else if (Number(counts.done || 0) > 0) {
+        root.applyPetMood("done", counts.done + " finished", true)
+      } else if (Number(counts.working || 0) > 0) {
+        root.applyPetMood("working", counts.working + " working", true)
+      } else {
+        root.applyPetMood("idle", "No active agents", true)
+      }
+    } catch (exception) {
+      root.applyPetMood("idle", "Omaherd unavailable", false)
+    }
+  }
+
   function bundledPetPath() {
     return root.pluginDir + "/assets/pet.webp"
   }
@@ -401,7 +466,15 @@ QtObject {
       root.fail("pet", "Choose a PNG, WebP, or JPEG OpenPets spritesheet.")
       return
     }
-    root.saveConfig({ lcdPetPath: next, lcdPet: true })
+    var patch = { lcdPetPath: next, lcdPet: true }
+    var recent = root.lcdPetFavorites.indexOf(next)
+    if (next && recent !== -1) {
+      var favorites = root.lcdPetFavorites.slice()
+      favorites.splice(recent, 1)
+      favorites.unshift(next)
+      patch.lcdPetFavorites = favorites
+    }
+    root.saveConfig(patch)
     root.log("lcd pet -> " + root.petName(next))
   }
 
@@ -414,7 +487,7 @@ QtObject {
     var wanted = String(path || root.resolvedPetPath())
     if (!wanted || root.isFavoritePet(wanted)) return
     var next = root.lcdPetFavorites.slice()
-    next.push(wanted)
+    next.unshift(wanted)
     root.saveConfig({ lcdPetFavorites: next })
   }
 
@@ -471,6 +544,7 @@ QtObject {
     if (immediate === true) root.saveConfig({ lcdPetY: next })
   }
 
+
   function writePetState() {
     var state = {
       accent: root.accentHex(),
@@ -478,6 +552,7 @@ QtObject {
       top: root.resolvedLcdTop(),
       bottom: root.resolvedLcdBottom(),
       wallpaper: root.lcdWallpaper ? root.backgroundPath : "",
+      wallpaperVersion: root.backgroundRevision,
       dim: root.lcdDim,
       zoom: root.lcdZoom,
       panX: Math.round(root.lcdPanX),
@@ -485,6 +560,7 @@ QtObject {
       brightness: Math.round(root.lcdBrightness),
       spritesheet: root.resolvedPetPath(),
       fps: 10,
+      petMood: root.lcdPetReactToOmaherd ? root.lcdPetMood : "idle",
       petScale: root.lcdPetScale,
       petX: Math.round(root.lcdPetX),
       petY: Math.round(root.lcdPetY)
@@ -1098,6 +1174,26 @@ QtObject {
     }
   }
 
+  property Timer omaherdTimer: Timer {
+    interval: 3000
+    repeat: true
+    running: root.lcdEnabled && root.lcdPet && root.lcdPetReactToOmaherd
+    onRunningChanged: if (running) root.refreshOmaherd()
+    onTriggered: root.refreshOmaherd()
+  }
+
+  property Process omaherdStatusProcess: Process {
+    stdout: SplitParser {
+      onRead: function(value) { root.applyOmaherdStatus(value) }
+    }
+    stderr: SplitParser {
+      onRead: function(value) {}
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.applyPetMood("idle", "Omaherd unavailable", false)
+    }
+  }
+
   // ------------------------------------------------------------ LCD cycle
 
   property Timer lcdDebounce: Timer {
@@ -1151,6 +1247,7 @@ QtObject {
     var fanInt = parseInt(root.lcdFan, 10)
     fanInt = isFinite(fanInt) ? Math.round(fanInt / 50) * 50 : root.lcdFan
     return root.currentThemeName + "|" + root.accentHex() + "|" + tempInt
+      + "|" + root.backgroundRevision
       + "|" + (root.lcdWallpaper ? "wp" : "plain")
       + "|" + root.lcdDim + "|" + (root.lcdThemeName ? "title" : "notitle")
       + "|" + root.lcdZoom + "|" + Math.round(root.lcdPanX)

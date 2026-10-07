@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install or list OpenPets catalog pets and print machine-readable results."""
+"""Search, install, remove, or list OpenPets catalog pets."""
 
 from __future__ import annotations
 
@@ -7,14 +7,164 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
+import shutil
 import sys
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from PIL import Image
 
 PET_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+CATALOG_ROOT = "https://openpets.dev/pets/catalog.v3.json"
+CACHE_SECONDS = 6 * 60 * 60
+MAX_JSON_BYTES = 4 * 1024 * 1024
+MAX_SPRITE_BYTES = 20 * 1024 * 1024
+USER_AGENT = "misza.rgbsync/0.1 OpenPets browser"
+
 
 def pets_root() -> Path:
     config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return config_home / "OpenPets" / "pets"
+
+
+def cache_root() -> Path:
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_home / "misza.rgbsync" / "openpets"
+
+
+def fetch(url: str, maximum: int) -> bytes:
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json,image/webp"})
+    with urlopen(request, timeout=12) as response:
+        length = response.headers.get("Content-Length")
+        if length and int(length) > maximum:
+            raise ValueError("OpenPets response is too large")
+        payload = response.read(maximum + 1)
+    if len(payload) > maximum:
+        raise ValueError("OpenPets response is too large")
+    return payload
+
+
+def fetch_json(url: str, cache_name: str, refresh: bool = False) -> dict:
+    cache = cache_root() / cache_name
+    if not refresh and cache.is_file() and time.time() - cache.stat().st_mtime < CACHE_SECONDS:
+        try:
+            value = json.loads(cache.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return value
+        except (OSError, ValueError):
+            pass
+    payload = fetch(url, MAX_JSON_BYTES)
+    value = json.loads(payload.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("OpenPets returned invalid catalog data")
+    cache.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = cache.with_suffix(".tmp")
+    temporary.write_bytes(payload)
+    os.chmod(temporary, 0o600)
+    temporary.replace(cache)
+    return value
+
+
+
+def search_catalog(query: str, limit: int = 12) -> list[dict]:
+    words = [word for word in re.split(r"[^a-z0-9]+", query.lower()) if word]
+    root = fetch_json(CATALOG_ROOT, "catalog.json")
+    search = fetch_json(str(root.get("search") or ""), "search.json")
+    candidates: list[tuple[int, int, dict]] = []
+    order = 0
+    for page_index, url in enumerate(search.get("pages") or []):
+        page = fetch_json(str(url), f"search-{page_index:03d}.json")
+        for pet in page.get("pets") or []:
+            if not isinstance(pet, dict):
+                continue
+            haystack = str(pet.get("searchText") or "").lower()
+            if words and not all(word in haystack for word in words):
+                continue
+            pet_id = str(pet.get("id") or "")
+            if not PET_ID.fullmatch(pet_id):
+                continue
+            name = str(pet.get("displayName") or pet_id)
+            exact = 0 if query and query.lower() in (pet_id, name.lower()) else 1
+            featured = 0 if pet.get("featured") is True else 1
+            record = {
+                "id": pet_id,
+                "name": name,
+                "category": str(pet.get("category") or ""),
+                "subcategory": str(pet.get("subcategory") or ""),
+                "featured": pet.get("featured") is True,
+                "original": pet.get("original") is True,
+                "catalogPage": int(pet.get("catalogPage") or 0),
+                "thumbnail": "",
+            }
+            candidates.append((exact * 10 + featured, order, record))
+            order += 1
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    results = [item[2] for item in candidates[:limit]]
+
+    # Compact search pages intentionally omit asset URLs. Resolve only the
+    # selected result pages so every thumbnail uses the catalog's exact URL
+    # rather than guessing a directory name from the pet ID.
+    details: dict[str, dict] = {}
+    catalog_pages = root.get("pages") or []
+    for page_index in sorted({pet["catalogPage"] for pet in results}):
+        if page_index < 0 or page_index >= len(catalog_pages):
+            continue
+        page = fetch_json(str(catalog_pages[page_index]), f"page-{page_index:03d}.json")
+        for pet in page.get("pets") or []:
+            if isinstance(pet, dict) and isinstance(pet.get("id"), str):
+                details[pet["id"]] = pet
+    for record in results:
+        detail = details.get(record["id"], {})
+        thumbnail = str(detail.get("thumbnail") or "")
+        if thumbnail.startswith("https://openpets.dev/pets/"):
+            record["thumbnail"] = thumbnail
+        record["description"] = str(detail.get("description") or "")
+        record.pop("catalogPage", None)
+    return results
+
+
+def catalog_pet(pet_id: str) -> dict | None:
+    root = fetch_json(CATALOG_ROOT, "catalog.json")
+    for page_index, url in enumerate(root.get("pages") or []):
+        page = fetch_json(str(url), f"page-{page_index:03d}.json")
+        for pet in page.get("pets") or []:
+            if isinstance(pet, dict) and pet.get("id") == pet_id:
+                return pet
+    return None
+
+
+def installed_thumbnail(pet_id: str, spritesheet: Path) -> Path:
+    thumbnail = cache_root() / "thumbs" / f"{pet_id}.webp"
+    if thumbnail.is_file() and thumbnail.stat().st_mtime >= spritesheet.stat().st_mtime:
+        return thumbnail
+    thumbnail.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with Image.open(spritesheet) as sheet:
+        sheet = sheet.convert("RGBA")
+        frame_width = sheet.width // 8
+        rows = 9 if sheet.height > sheet.width else 3
+        frame_height = sheet.height // rows
+        selected = None
+        for row in list(range(1, rows)) + [0]:
+            for column in range(8):
+                frame = sheet.crop((
+                    column * frame_width,
+                    row * frame_height,
+                    (column + 1) * frame_width,
+                    (row + 1) * frame_height,
+                ))
+                if frame.getchannel("A").getbbox():
+                    selected = frame
+                    break
+            if selected is not None:
+                break
+        if selected is None:
+            selected = sheet.crop((0, 0, frame_width, frame_height))
+        temporary = thumbnail.with_suffix(".tmp.webp")
+        selected.save(temporary, "WEBP", lossless=True)
+        os.chmod(temporary, 0o600)
+        temporary.replace(thumbnail)
+    return thumbnail
 
 
 def list_pets() -> int:
@@ -27,51 +177,106 @@ def list_pets() -> int:
         if not directory.is_dir() or not spritesheet.is_file():
             continue
         display_name = directory.name
+        description = ""
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             if isinstance(metadata.get("displayName"), str):
                 display_name = metadata["displayName"]
+            if isinstance(metadata.get("description"), str):
+                description = metadata["description"]
         except (OSError, ValueError, AttributeError):
             pass
+        try:
+            thumbnail = str(installed_thumbnail(directory.name, spritesheet))
+        except (OSError, ValueError):
+            thumbnail = ""
         print(json.dumps({
             "id": directory.name,
             "name": display_name,
+            "description": description,
             "path": str(spritesheet),
+            "thumbnail": thumbnail,
         }, ensure_ascii=False))
     return 0
 
 
-def main() -> int:
-    if len(sys.argv) == 2 and sys.argv[1] == "--list":
-        return list_pets()
-    pet_id = sys.argv[1].strip() if len(sys.argv) == 2 else ""
-    if not PET_ID.fullmatch(pet_id):
-        print("Pet ID must use lowercase letters, numbers, '-' or '_'.", file=sys.stderr)
-        return 2
-
-    spritesheet = pets_root() / pet_id / "spritesheet.webp"
-    if not spritesheet.is_file():
-        try:
-            result = subprocess.run(
-                ["npx", "-y", "install-pet", pet_id],
-                check=False,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-        except FileNotFoundError:
-            print("npx is not installed.", file=sys.stderr)
-            return 1
-        if result.returncode != 0 and not spritesheet.is_file():
-            message = result.stdout.strip() or "OpenPets installation failed."
-            print(message, file=sys.stderr)
-            return result.returncode or 1
-
-    if not spritesheet.is_file():
-        print("Installer finished without a spritesheet.", file=sys.stderr)
+def install_pet(pet_id: str) -> int:
+    destination = pets_root() / pet_id
+    spritesheet = destination / "spritesheet.webp"
+    if spritesheet.is_file():
+        print(spritesheet)
+        return 0
+    pet = catalog_pet(pet_id)
+    if pet is None:
+        print(f"No OpenPets catalog pet named '{pet_id}'.", file=sys.stderr)
         return 1
+    url = str(pet.get("spritesheet") or "")
+    if not url.startswith("https://openpets.dev/pets/") or not url.endswith("/spritesheet.webp"):
+        print("OpenPets catalog returned an unsafe spritesheet URL.", file=sys.stderr)
+        return 1
+    payload = fetch(url, MAX_SPRITE_BYTES)
+    if len(payload) < 12 or payload[:4] != b"RIFF" or payload[8:12] != b"WEBP":
+        print("OpenPets returned an invalid WebP spritesheet.", file=sys.stderr)
+        return 1
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{pet_id}-", dir=destination.parent))
+    try:
+        metadata = {
+            "id": pet_id,
+            "displayName": str(pet.get("displayName") or pet_id),
+            "description": str(pet.get("description") or ""),
+            "spritesheetPath": "spritesheet.webp",
+            "category": str(pet.get("category") or ""),
+            "subcategory": str(pet.get("subcategory") or ""),
+            "sourceUrl": url,
+        }
+        (temporary / "spritesheet.webp").write_bytes(payload)
+        (temporary / "pet.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(temporary / "spritesheet.webp", 0o600)
+        os.chmod(temporary / "pet.json", 0o600)
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
     print(spritesheet)
     return 0
+
+
+def remove_pet(pet_id: str) -> int:
+    destination = pets_root() / pet_id
+    if not destination.is_dir():
+        print(f"Pet '{pet_id}' is not installed.", file=sys.stderr)
+        return 1
+    shutil.rmtree(destination)
+    print(pet_id)
+    return 0
+
+
+def main() -> int:
+    try:
+        if len(sys.argv) == 2 and sys.argv[1] == "--list":
+            return list_pets()
+        if len(sys.argv) >= 2 and sys.argv[1] == "--search":
+            query = " ".join(sys.argv[2:]).strip()
+            for pet in search_catalog(query):
+                print(json.dumps(pet, ensure_ascii=False))
+            return 0
+        if len(sys.argv) == 3 and sys.argv[1] == "--remove":
+            pet_id = sys.argv[2].strip()
+            if not PET_ID.fullmatch(pet_id):
+                raise ValueError("Pet ID must use lowercase letters, numbers, '-' or '_'.")
+            return remove_pet(pet_id)
+        pet_id = sys.argv[1].strip() if len(sys.argv) == 2 else ""
+        if not PET_ID.fullmatch(pet_id) or pet_id == "builtin":
+            raise ValueError("Pet ID must use lowercase letters, numbers, '-' or '_'.")
+        return install_pet(pet_id)
+    except (HTTPError, URLError, TimeoutError) as error:
+        print(f"Could not reach the OpenPets catalog: {error}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

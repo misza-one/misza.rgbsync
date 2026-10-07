@@ -37,6 +37,9 @@ PET_H = 176
 ROW_IDLE = 0
 ROW_RIGHT = 1
 ROW_LEFT = 2
+ROW_WAVING = 3
+ROW_WAITING = 6
+ROW_REVIEW = 8
 FONT_CANDIDATES = [
     "/usr/share/fonts/noto/NotoSans-Bold.ttf",
     "/usr/share/fonts/noto/NotoSans-Regular.ttf",
@@ -87,18 +90,24 @@ def to_bgr888(img: Image.Image) -> bytes:
     return data
 
 
+def frame_is_visible(frame: Image.Image) -> bool:
+    """Reject placeholder cells that would make the pet blink out."""
+    histogram = frame.getchannel("A").histogram()
+    opaque_pixels = sum(alpha * count for alpha, count in enumerate(histogram)) / 255
+    return opaque_pixels >= frame.width * frame.height * 0.04
+
+
 def load_sheet(path: str, pet_h: int) -> list[list[Image.Image]]:
     img = Image.open(path).convert("RGBA")
-    # OpenPets downloads are normally the full 8×9 sheet. The bundled asset
-    # is cropped to the three rows used here: idle, run-right, run-left.
+    # Catalog sheets expose all nine OpenPets animation rows. The bundled
+    # fallback is cropped to idle and directional walking.
     source_rows = 9 if img.height > img.width else ROWS
     fw = img.width // COLS
     fh = img.height // source_rows
     if fw < 8 or fh < 8:
         raise RuntimeError("spritesheet too small: %sx%s" % img.size)
-    pet_h = max(64, min(400, int(pet_h)))
     rows = []
-    for r in range(ROWS):
+    for r in range(source_rows):
         row = []
         for c in range(COLS):
             tile = img.crop((c * fw, r * fh, (c + 1) * fw, (r + 1) * fh))
@@ -106,7 +115,8 @@ def load_sheet(path: str, pet_h: int) -> list[list[Image.Image]]:
                 nw = max(1, round(fw * pet_h / fh))
                 tile = tile.resize((nw, pet_h), Image.Resampling.NEAREST)
             row.append(tile)
-        rows.append(row)
+        visible = [frame for frame in row if frame_is_visible(frame)]
+        rows.append(visible or [row[0]])
     return rows
 
 
@@ -119,12 +129,14 @@ class Splash:
         self.sheet_path = ""
         self.sheet_h = 0
         self.cache_key = ""
+        self.wallpaper_signature = ""
         self.x = 160.0
         self.dir = 1
         self.frame = 0
         self.left = 110.0
         self.right = 530.0
         self.feet_y = 510
+        self.mood = "idle"
 
     def _font(self, size: int) -> ImageFont.ImageFont:
         if self.font_path:
@@ -251,14 +263,15 @@ class Splash:
         except (TypeError, ValueError):
             feet = 510
         self.feet_y = min(620, max(360, feet))
+        mood = str(state.get("petMood") or "idle")
+        self.mood = mood if mood in {"blocked", "done", "working"} else "idle"
         center = 320 + min(220, max(-220, pet_x))
-        span = 200
-        self.left = max(70, center - span)
-        self.right = min(570, center + span)
-        if self.x < self.left:
-            self.x = self.left
-        if self.x > self.right:
-            self.x = self.right
+        # Position is a fixed anchor. The walking sprites animate in place;
+        # drifting across the LCD made a centered pet appear misconfigured.
+        self.left = center
+        self.right = center
+        self.x = center
+        self.dir = 1
         if sheet != self.sheet_path or pet_h != self.sheet_h:
             if os.path.exists(sheet):
                 try:
@@ -276,8 +289,19 @@ class Splash:
                 self.sheet = None
                 self.sheet_path = sheet
                 self.sheet_h = pet_h
+        wallpaper = str(state.get("wallpaper") or "")
+        wallpaper_signature = ""
+        if wallpaper:
+            try:
+                info = os.stat(wallpaper)
+                wallpaper_signature = "%s:%s:%s" % (
+                    os.path.realpath(wallpaper), info.st_mtime_ns, info.st_size)
+            except OSError:
+                wallpaper_signature = "missing"
         key = "|".join([
-            str(state.get("wallpaper") or ""),
+            wallpaper,
+            wallpaper_signature,
+            str(state.get("wallpaperVersion", 0)),
             str(state.get("dim")),
             str(state.get("zoom")),
             str(state.get("panX")),
@@ -290,16 +314,24 @@ class Splash:
         if key == self.cache_key and self.base is not None:
             return
         self.base = self._build_base(state)
+        if (self.wallpaper_signature
+                and wallpaper_signature != self.wallpaper_signature):
+            log("background reloaded")
+        self.wallpaper_signature = wallpaper_signature
         self.overlay = self._build_overlay(state)
         self.cache_key = key
 
     def step(self, dt: float) -> None:
-        speed = 90.0
-        self.x += self.dir * speed * dt
-        if self.x >= self.right:
-            self.x = self.right
-            self.dir = -1
-        elif self.x <= self.left:
+        if self.mood == "idle" and self.left < self.right:
+            speed = 90.0
+            self.x += self.dir * speed * dt
+            if self.x >= self.right:
+                self.x = self.right
+                self.dir = -1
+            elif self.x <= self.left:
+                self.x = self.left
+                self.dir = 1
+        else:
             self.x = self.left
             self.dir = 1
         self.frame = (self.frame + 1) % COLS
@@ -311,7 +343,15 @@ class Splash:
             frame = self.base.copy()
         if self.sheet:
             row = ROW_RIGHT if self.dir > 0 else ROW_LEFT
-            pet = self.sheet[row][self.frame % COLS]
+            if len(self.sheet) >= 9:
+                if self.mood == "blocked":
+                    row = ROW_WAITING
+                elif self.mood == "done":
+                    row = ROW_WAVING
+                elif self.mood == "working":
+                    row = ROW_REVIEW
+            animation = self.sheet[row]
+            pet = animation[self.frame % len(animation)]
             px = int(round(self.x - pet.width / 2))
             py = self.feet_y - pet.height
             frame.paste(pet, (px, py), pet)
@@ -339,6 +379,7 @@ def default_state() -> dict:
         "petScale": 1.0,
         "petX": 0,
         "petY": 510,
+        "petMood": "idle",
     }
 
 def load_state(path: str) -> dict:
@@ -409,6 +450,10 @@ def run_stream(state_path: str, once: bool) -> int:
                         log("state reloaded")
                     except Exception as exc:
                         log("state reload failed: %s" % exc)
+            # A background-only change replaces the stable `current/background`
+            # symlink without changing the state JSON values. Check its target
+            # signature every frame so the live stream updates immediately.
+            splash.ensure(state)
             now = time.monotonic()
             splash.step(period)
             frame = splash.render(rotate)

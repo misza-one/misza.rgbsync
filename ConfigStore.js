@@ -7,7 +7,8 @@ var KEYS = [
   "lcdEnabled", "lcdBrightness", "lcdWallpaper", "lcdDim", "lcdThemeName",
   "lcdTitle", "lcdTop", "lcdBottom",
   "lcdZoom", "lcdPanX", "lcdPanY", "lcdPet", "lcdPetPath",
-  "lcdPetFavorites", "lcdPetScale", "lcdPetX", "lcdPetY", "liquidctlBinary"
+  "lcdPetFavorites", "lcdPetScale", "lcdPetX", "lcdPetY",
+  "lcdPetReactToOmaherd", "liquidctlBinary"
 ]
 
 function stringList(value, fallback) {
@@ -195,6 +196,7 @@ function parse(text) {
       lcdPetScale: petScale(raw.lcdPetScale, 1),
       lcdPetX: petWalkX(raw.lcdPetX),
       lcdPetY: petWalkY(raw.lcdPetY, 510),
+      lcdPetReactToOmaherd: raw.lcdPetReactToOmaherd !== false,
       liquidctlBinary: typeof raw.liquidctlBinary === "string"
         && raw.liquidctlBinary.length > 0
         && raw.liquidctlBinary.length <= 128

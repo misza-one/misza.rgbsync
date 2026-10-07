@@ -14,8 +14,9 @@ RGB Sync — sync PC lighting to the Omarchy theme.
   periodically.
 - Optional **animated pet overlay**: walks an OpenPets spritesheet on top
   of that wallpaper via NZXT CAM's live LCD stream (`0x09` BGR888), not
-  `liquidctl` GIF. The popup includes an animated preview, file picker,
-  favorites, and one-click switching.
+  `liquidctl` GIF. The popup browses and searches the live catalog, installs
+  pets directly, previews animations, manages installed pets and favorites,
+  and can react to Omaherd agent state.
 - Keeps one OpenRGB SDK server alive, avoiding a full 18–40 second hardware
   scan on every theme change. Reconciles once after startup so USB monitors
   whose firmware finishes booting late cannot overwrite the synchronized
@@ -36,8 +37,8 @@ omarchy plugin add https://github.com/misza-one/misza.rgbsync.git --enable
 - `liquidctl` on `PATH` for the Kraken LCD (override path in config).
 - `python-pillow` for LCD image rendering.
 - LCD pet overlay and Keychron Q3 Pro sync need Python `hid`; the LCD stream
-  additionally needs `pyusb` and `zenity`. Installing catalog pets by ID needs
-  Node.js/npm (`npx`).
+  additionally needs `pyusb` and `zenity`. Catalog search and installation
+  use Python's standard library and require network access to `openpets.dev`.
 - Hardware access: user in `input` + `i2c` groups (or active logind session
   via uaccess). Re-login after adding groups.
 
@@ -96,6 +97,7 @@ IPC: `omarchy-shell misza.rgbsync status` / `... refresh`.
   "lcdPetScale": 1,
   "lcdPetX": 0,
   "lcdPetY": 510,
+  "lcdPetReactToOmaherd": true,
   "liquidctlBinary": "liquidctl"
 }
 ```
@@ -115,18 +117,20 @@ IPC: `omarchy-shell misza.rgbsync status` / `... refresh`.
 - `lcdZoom` (1–3) + `lcdPanX`/`lcdPanY`: wallpaper framing. The popup shows
   a round live preview — drag to position, zoom with the slider, release
   applies to the pump. `Reset wallpaper view` restores full-bleed.
-- `lcdPet`: stream an OpenPets walk on top of the wallpaper (CAM `0x09`).
-  Open **Pet library** in the popup. Pets previously installed from a terminal
-  with `npx -y install-pet <id>` are discovered automatically under
-  **Installed OpenPets** and can be selected with **Use**. You can also paste a
-  catalog ID such as `gpt-niang` and click **Install**; this runs the official
-  installer, selects the downloaded spritesheet, and adds it to favorites.
-  Local PNG/WebP/JPEG sheets work through **Choose file…**. Star favorites,
-  switch them with **Use**, or restore the bundled pet. Both full 8×9 OpenPets
-  sheets and cropped 8×3 sheets work.
+- `lcdPet`: stream an OpenPets companion on top of the wallpaper (CAM `0x09`).
+  Open **Pet library** in the popup to browse featured pets or search the
+  complete catalog by name, ID, description, or category. **Install** downloads
+  the selected spritesheet directly from `openpets.dev`, selects it, and adds
+  it to favorites. Installed pets can be switched or deleted in place; pets
+  installed by the official OpenPets tools are discovered from the same
+  directory. Local PNG/WebP/JPEG sheets work through **Choose file…**. Both
+  full 8×9 OpenPets sheets and cropped 8×3 sheets work.
+- `lcdPetReactToOmaherd`: poll the installed Omaherd widget while the LCD pet
+  is active. The pet waits when an agent needs input, reviews while agents
+  work, waves when work finishes, and resumes walking when the herd is idle.
 - `lcdPetPath`: selected spritesheet; empty uses the bundled companion.
-  `lcdPetFavorites` stores up to 32 absolute paths. `lcdPetScale`,
-  `lcdPetX`, and `lcdPetY` control size and walking position.
+  `lcdPetFavorites` stores up to 32 absolute paths. `lcdPetScale`, `lcdPetX`,
+  and `lcdPetY` control size and walking position.
 
 ## Notes
 
