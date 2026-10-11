@@ -547,10 +547,13 @@ Panel {
 
                 Image {
                   id: petSheetPreview
-                  readonly property int sheetRows:
-                    sourceSize.height > sourceSize.width ? 9 : 3
-                  readonly property real frameWidth: 72
+                  // OpenPets cells are 192x208; sheets carry 3, 9, or 11 rows.
+                  readonly property int sheetRows: sourceSize.width > 0
+                    ? Math.max(1, Math.round(sourceSize.height
+                        / (sourceSize.width / 8 * 208 / 192)))
+                    : 3
                   readonly property real frameHeight: 96
+                  readonly property real frameWidth: frameHeight * 192 / 208
                   source: "file://" + root.svc.resolvedPetPath()
                   cache: false
                   asynchronous: true

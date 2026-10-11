@@ -135,14 +135,15 @@ def catalog_pet(pet_id: str) -> dict | None:
 
 
 def installed_thumbnail(pet_id: str, spritesheet: Path) -> Path:
-    thumbnail = cache_root() / "thumbs" / f"{pet_id}.webp"
+    # v2: row count derived from the 192x208 cell, not a fixed 9 rows.
+    thumbnail = cache_root() / "thumbs" / f"{pet_id}.v2.webp"
     if thumbnail.is_file() and thumbnail.stat().st_mtime >= spritesheet.stat().st_mtime:
         return thumbnail
     thumbnail.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with Image.open(spritesheet) as sheet:
         sheet = sheet.convert("RGBA")
         frame_width = sheet.width // 8
-        rows = 9 if sheet.height > sheet.width else 3
+        rows = max(1, round(sheet.height / (frame_width * 208 / 192)))
         frame_height = sheet.height // rows
         selected = None
         for row in list(range(1, rows)) + [0]:

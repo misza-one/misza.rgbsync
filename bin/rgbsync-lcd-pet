@@ -32,7 +32,9 @@ BG = (0x10, 0x13, 0x15)
 MUTED = (0x86, 0x76, 0x58)
 WHITE = (0xCA, 0xCC, 0xCC)
 COLS = 8
-ROWS = 3  # bundled sheet: idle, run-right, run-left
+# OpenPets cells are 192x208. Sheets carry 3 (bundled), 9, or 11 rows; the
+# first nine rows always share the same animation order.
+CELL_ASPECT = 208 / 192
 PET_H = 176
 ROW_IDLE = 0
 ROW_RIGHT = 1
@@ -97,11 +99,13 @@ def frame_is_visible(frame: Image.Image) -> bool:
     return opaque_pixels >= frame.width * frame.height * 0.04
 
 
+def sheet_rows(width: int, height: int) -> int:
+    return max(1, round(height / (width / COLS * CELL_ASPECT)))
+
+
 def load_sheet(path: str, pet_h: int) -> list[list[Image.Image]]:
     img = Image.open(path).convert("RGBA")
-    # Catalog sheets expose all nine OpenPets animation rows. The bundled
-    # fallback is cropped to idle and directional walking.
-    source_rows = 9 if img.height > img.width else ROWS
+    source_rows = sheet_rows(img.width, img.height)
     fw = img.width // COLS
     fh = img.height // source_rows
     if fw < 8 or fh < 8:
@@ -350,7 +354,7 @@ class Splash:
                     row = ROW_WAVING
                 elif self.mood == "working":
                     row = ROW_REVIEW
-            animation = self.sheet[row]
+            animation = self.sheet[min(row, len(self.sheet) - 1)]
             pet = animation[self.frame % len(animation)]
             px = int(round(self.x - pet.width / 2))
             py = self.feet_y - pet.height
