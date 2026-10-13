@@ -159,13 +159,28 @@ class KrakenLcd:
         self._write(data)
         return self._read(80) or bytes(REPORT)
 
+    def _read_reply(self, prefix: bytes, attempts: int = 16) -> bytes | None:
+        # The pump interleaves replies to other clients (CoolerControl polls
+        # status), so the next report is not necessarily ours.
+        for _ in range(attempts):
+            msg = self._read(80)
+            if msg is None:
+                return None
+            if msg.startswith(prefix):
+                return msg
+        return None
+
     def read_lcd_info(self) -> tuple[int, int]:
         self._hid_open()
         try:
             self._drain()
-            msg = self._write_then_read(bytes([0x30, 0x01]))
-            self.brightness = msg[0x18]
-            self.orientation = msg[0x1A]
+            self._write(bytes([0x30, 0x01]))
+            msg = self._read_reply(bytes([0x31, 0x01]))
+            # No reply keeps the previous values: a stray report once read as
+            # orientation 20 and got written back to the pump as 0.
+            if msg is not None and msg[0x1A] <= 3:
+                self.brightness = msg[0x18]
+                self.orientation = msg[0x1A]
             return self.brightness, self.orientation
         finally:
             self._hid_close()
